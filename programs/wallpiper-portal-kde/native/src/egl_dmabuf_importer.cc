@@ -32,15 +32,25 @@
 #include <qsgtexture_platform.h>
 
 #include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 
 #include <linux/dma-buf.h>
 
+#ifndef EGL_DEVICE_EXT
+#define EGL_DEVICE_EXT 0x322C
+#endif
+#ifndef EGL_DRM_DEVICE_FILE_EXT
+#define EGL_DRM_DEVICE_FILE_EXT 0x3233
+#endif
+#ifndef EGL_DRM_RENDER_NODE_FILE_EXT
+#define EGL_DRM_RENDER_NODE_FILE_EXT 0x3377
+#endif
+
 namespace WallpiperKde {
 
 namespace {
-constexpr uint32_t kDrmFormatXrgb8888 = 0x34325258;
-
 struct FdCloser {
   int fd;
   ~FdCloser() { ::close(fd); }
@@ -131,7 +141,8 @@ bool EglDmabufImporter::ensureBound(QQuickWindow *window) {
 
 std::optional<EglDmabufImporter::Import>
 EglDmabufImporter::importDmabuf(int width, int height, uint32_t stride,
-                                uint64_t modifier, int fd) const {
+                                uint64_t modifier, uint32_t drmFourcc,
+                                int fd) const {
   const FdCloser fdCloser{fd};
 
   if (!isBound()) {
@@ -147,7 +158,7 @@ EglDmabufImporter::importDmabuf(int width, int height, uint32_t stride,
       EGL_HEIGHT,
       height,
       EGL_LINUX_DRM_FOURCC_EXT,
-      static_cast<EGLAttrib>(kDrmFormatXrgb8888),
+      static_cast<EGLAttrib>(drmFourcc),
       EGL_DMA_BUF_PLANE0_FD_EXT,
       fd,
       EGL_DMA_BUF_PLANE0_OFFSET_EXT,
@@ -198,7 +209,8 @@ EglDmabufImporter::importDmabuf(int width, int height, uint32_t stride,
 
 std::optional<EGLImageKHR>
 EglDmabufImporter::createImageOnly(int width, int height, uint32_t stride,
-                                   uint64_t modifier, int fd) const {
+                                   uint64_t modifier, uint32_t drmFourcc,
+                                   int fd) const {
   const FdCloser fdCloser{fd};
 
   if (!isBound()) {
@@ -214,7 +226,7 @@ EglDmabufImporter::createImageOnly(int width, int height, uint32_t stride,
       EGL_HEIGHT,
       height,
       EGL_LINUX_DRM_FOURCC_EXT,
-      static_cast<EGLAttrib>(kDrmFormatXrgb8888),
+      static_cast<EGLAttrib>(drmFourcc),
       EGL_DMA_BUF_PLANE0_FD_EXT,
       fd,
       EGL_DMA_BUF_PLANE0_OFFSET_EXT,
@@ -293,6 +305,47 @@ bool EglDmabufImporter::waitForSyncFd(int syncFd) const {
                << Qt::hex << result;
     return false;
   }
+  return true;
+}
+
+bool EglDmabufImporter::queryRenderNode(uint32_t *major,
+                                        uint32_t *minor) const {
+  if (!isBound()) {
+    return false;
+  }
+
+  using EglQueryDisplayAttribEXTFn = EGLBoolean (*)(EGLDisplay, EGLint,
+                                                    EGLAttrib *);
+  using EglQueryDeviceStringEXTFn = const char *(*)(EGLDeviceEXT, EGLint);
+
+  auto queryDisplayAttrib = reinterpret_cast<EglQueryDisplayAttribEXTFn>(
+      eglGetProcAddress("eglQueryDisplayAttribEXT"));
+  auto queryDeviceString = reinterpret_cast<EglQueryDeviceStringEXTFn>(
+      eglGetProcAddress("eglQueryDeviceStringEXT"));
+  if (!queryDisplayAttrib || !queryDeviceString) {
+    return false;
+  }
+
+  EGLAttrib deviceAttrib = 0;
+  if (!queryDisplayAttrib(m_display, EGL_DEVICE_EXT, &deviceAttrib)) {
+    return false;
+  }
+  auto device = reinterpret_cast<EGLDeviceEXT>(deviceAttrib);
+
+  const char *path = queryDeviceString(device, EGL_DRM_RENDER_NODE_FILE_EXT);
+  if (!path) {
+    path = queryDeviceString(device, EGL_DRM_DEVICE_FILE_EXT);
+  }
+  if (!path) {
+    return false;
+  }
+
+  struct stat st{};
+  if (::stat(path, &st) != 0) {
+    return false;
+  }
+  *major = ::major(st.st_rdev);
+  *minor = ::minor(st.st_rdev);
   return true;
 }
 

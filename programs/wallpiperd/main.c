@@ -116,16 +116,42 @@ static void *daemon_ctl_listener_thread_main(void *arg) {
       }
     }
     line[total] = '\0';
+    while (total > 0 && (line[total - 1] == '\n' || line[total - 1] == '\r')) {
+      line[--total] = '\0';
+    }
 
     char args_storage[1024];
     snprintf(args_storage, sizeof(args_storage), "%s", line);
     const char *argv_ptrs[64];
     size_t argc = 0;
-    char *saveptr = NULL;
-    char *tok = strtok_r(args_storage, " \t\r\n", &saveptr);
-    while (tok && argc < 64) {
-      argv_ptrs[argc++] = tok;
-      tok = strtok_r(NULL, " \t\r\n", &saveptr);
+
+    if (strncmp(args_storage, "capture ", 8) == 0) {
+      char *p = args_storage + 8;
+      while (*p == ' ' || *p == '\t') {
+        p++;
+      }
+      char *monitor_tok = p;
+      while (*p && *p != ' ' && *p != '\t') {
+        p++;
+      }
+      if (p != monitor_tok && *p) {
+        *p++ = '\0';
+        while (*p == ' ' || *p == '\t') {
+          p++;
+        }
+        if (*p) {
+          argv_ptrs[argc++] = "capture";
+          argv_ptrs[argc++] = monitor_tok;
+          argv_ptrs[argc++] = p;
+        }
+      }
+    } else {
+      char *saveptr = NULL;
+      char *tok = strtok_r(args_storage, " \t\r\n", &saveptr);
+      while (tok && argc < 64) {
+        argv_ptrs[argc++] = tok;
+        tok = strtok_r(NULL, " \t\r\n", &saveptr);
+      }
     }
 
     char resp[512];
@@ -184,6 +210,18 @@ static void print_help(void) {
       "      default: $XDG_STATE_HOME/wallpiper, or ~/.local/state/wallpiper\n"
       "      brief:   Directory used for state that should persist across "
       "reboots.\n"
+      "\n"
+      "  WALLPIPER_CAPTURE_RENDER_NODE\n"
+      "      default: auto-detected from the active portal's DRM render "
+      "node\n"
+      "      brief:   Which GPU (major:minor, e.g. 226:1) Wallpaper Engine's\n"
+      "               renderer should use. Normally set automatically to "
+      "match\n"
+      "               whichever GPU the compositor/portal is bound to, so "
+      "dmabuf\n"
+      "               capture doesn't fail cross-GPU on hybrid/multi-GPU "
+      "systems.\n"
+      "               Set this yourself to override auto-detection.\n"
       "\n"
       "  WALLPIPER_WE_UI_SCALE_FACTOR\n"
       "      default: unset (no scaling override)\n"

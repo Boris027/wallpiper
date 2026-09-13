@@ -35,7 +35,7 @@ QT_FORWARD_DECLARE_CLASS(QSGTexture)
 
 namespace WallpiperKde {
 
-constexpr unsigned int kGlTextureExternalOes = 0x8D65;
+constexpr unsigned int kGlTextureExternalOes = 0x0DE1; // GL_TEXTURE_2D
 
 class EglDmabufImporter {
 public:
@@ -49,15 +49,18 @@ public:
   bool isBound() const;
 
   std::optional<Import> importDmabuf(int width, int height, uint32_t stride,
-                                     uint64_t modifier, int fd) const;
+                                     uint64_t modifier, uint32_t drmFourcc,
+                                     int fd) const;
   void destroyImport(const Import &import) const;
   void refreshBinding(const Import &import) const;
 
   std::optional<EGLImageKHR> createImageOnly(int width, int height,
                                              uint32_t stride, uint64_t modifier,
-                                             int fd) const;
+                                             uint32_t drmFourcc, int fd) const;
   void destroyEglImage(EGLImageKHR image) const;
   bool waitForSyncFd(int syncFd) const;
+
+  bool queryRenderNode(uint32_t *major, uint32_t *minor) const;
 
   QSGTexture *wrapExternalOes(QQuickWindow *window, const Import &import,
                               const QSize &size) const;

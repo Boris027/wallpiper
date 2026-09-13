@@ -25,7 +25,10 @@
 
 #include "portal.h"
 
+#include <errno.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 bool wp_commands_dispatch(const char *const *args, size_t arg_count,
@@ -44,6 +47,22 @@ bool wp_commands_dispatch(const char *const *args, size_t arg_count,
   if (strcmp(cmd, "debug-off") == 0) {
     wp_portal_set_debug_overlay(false);
     return true;
+  }
+  if (strcmp(cmd, "capture") == 0) {
+    if (arg_count < 3) {
+      snprintf(err_out, err_out_len, "usage: capture <channel> <path>");
+      return false;
+    }
+    char *end = NULL;
+    errno = 0;
+    unsigned long channel = strtoul(args[1], &end, 10);
+    if (end == args[1] || *end != '\0' || errno == ERANGE ||
+        channel > UINT32_MAX) {
+      snprintf(err_out, err_out_len, "invalid capture channel: %s", args[1]);
+      return false;
+    }
+    return wp_portal_capture_frame((uint32_t)channel, args[2], err_out,
+                                   err_out_len);
   }
 
   snprintf(err_out, err_out_len, "unknown command: %s", cmd);

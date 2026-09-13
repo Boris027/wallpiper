@@ -26,11 +26,17 @@
 #include "config.h"
 #include "logging.h"
 
+#include "wallpiper/vk_format.h"
+
 #include <dlfcn.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+
+#ifndef DRM_FORMAT_MOD_LINEAR
+#define DRM_FORMAT_MOD_LINEAR 0ull
+#endif
 
 typedef struct {
   unsigned int sequence;
@@ -104,11 +110,17 @@ static bool wp_x11_window_geometry(unsigned long xid, int32_t *out_x,
   return true;
 }
 
+static bool wp_force_linear_modifier(void) {
+  const char *v = getenv("WALLPIPER_FORCE_LINEAR");
+  return v && v[0] && v[0] != '0';
+}
+
 static uint32_t compute_candidate_modifiers(wp_device_data_t *dd,
                                             VkFormat format, uint64_t *out,
                                             uint32_t max_out) {
-  VkFormatFeatureFlags required =
-      VK_FORMAT_FEATURE_TRANSFER_DST_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+  VkFormatFeatureFlags required = VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
+                                  VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+                                  VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
 
   VkDrmFormatModifierPropertiesListEXT modifier_list = {
       .sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT,
@@ -140,15 +152,32 @@ static uint32_t compute_candidate_modifiers(wp_device_data_t *dd,
   wp_global_instance_get_format_properties2(dd->physical_device, format,
                                             &props2b);
 
+  const bool force_linear = wp_force_linear_modifier();
   uint32_t n = 0;
+  bool linear_usable = false;
   for (uint32_t i = 0; i < count && n < max_out; i++) {
     const VkDrmFormatModifierPropertiesEXT *m = &modifier_props[i];
     if (m->drmFormatModifierPlaneCount == 1 &&
         (m->drmFormatModifierTilingFeatures & required) == required) {
       out[n++] = m->drmFormatModifier;
+      if (m->drmFormatModifier == DRM_FORMAT_MOD_LINEAR) {
+        linear_usable = true;
+      }
     }
   }
   free(modifier_props);
+
+  if (force_linear && linear_usable) {
+    out[0] = DRM_FORMAT_MOD_LINEAR;
+    WP_LOG("WALLPIPER_FORCE_LINEAR set: restricting capture image to "
+           "DRM_FORMAT_MOD_LINEAR");
+    return 1;
+  }
+  if (force_linear) {
+    WP_LOG("WALLPIPER_FORCE_LINEAR set but no usable linear modifier is "
+           "advertised for this format; keeping %u tiled candidate(s)",
+           n);
+  }
   return n;
 }
 
@@ -570,6 +599,16 @@ static bool get_channel_geometry(uint32_t channel, int32_t *out_x,
 
 void wp_register_swapchain(wp_device_data_t *dd, VkSwapchainKHR swapchain,
                            const VkSwapchainCreateInfoKHR *create_info) {
+  int format_matched = 0;
+  wp_drm_fourcc_from_vk_format((uint32_t)create_info->imageFormat,
+                               &format_matched);
+  if (!format_matched) {
+    WP_LOG("register_swapchain: unsupported VkFormat=%d, capture disabled "
+           "for this swapchain (would corrupt colors)",
+           (int)create_info->imageFormat);
+    return;
+  }
+
   VkImage images[16];
   uint32_t image_count;
   get_swapchain_images(dd, swapchain, images, 16, &image_count);

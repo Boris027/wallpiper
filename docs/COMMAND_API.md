@@ -10,6 +10,7 @@ $ wallpiperctl <command>
 
 * `debug-off` toggle debug menu on wallpaper renderer off
 * `debug-on` toggle debug menu on wallpaper renderer on
+* `capture <channel; int; 0-indexed, not necessarily a monitor index> <path>` write the current wallpaper frame on the given capture channel to `path` as a PNG
 
 ## Wallpaper Engine Commands
 

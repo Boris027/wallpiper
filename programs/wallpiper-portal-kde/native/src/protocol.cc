@@ -28,6 +28,7 @@
 #include <cctype>
 #include <cstddef>
 #include <cstring>
+#include <limits>
 #include <sstream>
 #include <vector>
 
@@ -117,6 +118,7 @@ std::optional<SocketEvent> parseEvent(const std::string &header,
       event.slot = static_cast<uint32_t>(std::stoul(parts[1]));
       event.width = static_cast<uint32_t>(std::stoul(parts[2]));
       event.height = static_cast<uint32_t>(std::stoul(parts[3]));
+      event.format = static_cast<uint32_t>(std::stoul(parts[4]));
       event.stride = static_cast<uint32_t>(std::stoul(parts[5]));
       event.modifier = std::stoull(parts[6]);
       if (parts.size() >= 9) {
@@ -283,7 +285,53 @@ std::optional<CtlRequest> parseCtlRequest(const std::string &line) {
     return CtlRequest::CursorPos;
   if (trimmed == "PING")
     return CtlRequest::Ping;
+  if (trimmed == "RENDER_NODE")
+    return CtlRequest::RenderNode;
+  if (trimmed.rfind("CAPTURE ", 0) == 0)
+    return CtlRequest::Capture;
   return std::nullopt;
+}
+
+std::optional<CtlRequestCapture> parseCtlRequestCapture(const std::string &line) {
+  std::string trimmed = line;
+  while (!trimmed.empty() &&
+         std::isspace(static_cast<unsigned char>(trimmed.back()))) {
+    trimmed.pop_back();
+  }
+  if (trimmed.rfind("CAPTURE ", 0) != 0) {
+    return std::nullopt;
+  }
+  std::istringstream stream(trimmed.substr(8));
+  std::string channelStr;
+  if (!(stream >> channelStr)) {
+    return std::nullopt;
+  }
+  std::string rest;
+  std::getline(stream, rest);
+  size_t start = 0;
+  while (start < rest.size() &&
+         std::isspace(static_cast<unsigned char>(rest[start]))) {
+    ++start;
+  }
+  rest = rest.substr(start);
+  if (rest.empty()) {
+    return std::nullopt;
+  }
+
+  try {
+    size_t consumed = 0;
+    unsigned long channel = std::stoul(channelStr, &consumed);
+    if (consumed != channelStr.size() ||
+        channel > std::numeric_limits<uint32_t>::max()) {
+      return std::nullopt;
+    }
+    CtlRequestCapture result;
+    result.channel = static_cast<uint32_t>(channel);
+    result.path = QString::fromStdString(rest);
+    return result;
+  } catch (const std::exception &) {
+    return std::nullopt;
+  }
 }
 
 std::string encodeCtlRequest(CtlRequest request) {
@@ -300,6 +348,10 @@ std::string encodeCtlRequest(CtlRequest request) {
     return "CURSOR_POS\n";
   case CtlRequest::Ping:
     return "PING\n";
+  case CtlRequest::RenderNode:
+    return "RENDER_NODE\n";
+  case CtlRequest::Capture:
+    return {};
   }
   return {};
 }
@@ -319,6 +371,10 @@ std::string encodeCtlResponse(const CtlResponse &response) {
   if (const auto *cursor = std::get_if<CtlResponseCursorPos>(&response)) {
     return "CURSOR_POS " + std::to_string(cursor->x) + " " +
            std::to_string(cursor->y) + "\n";
+  }
+  if (const auto *node = std::get_if<CtlResponseRenderNode>(&response)) {
+    return "RENDER_NODE " + std::to_string(node->major) + " " +
+           std::to_string(node->minor) + "\n";
   }
   return {};
 }

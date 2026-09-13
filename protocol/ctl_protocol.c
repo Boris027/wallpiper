@@ -71,6 +71,9 @@ bool wp_ctl_request_encode(wp_ctl_request_t request, char *out,
   case WP_CTL_REQUEST_PING:
     text = "PING\n";
     break;
+  case WP_CTL_REQUEST_RENDER_NODE:
+    text = "RENDER_NODE\n";
+    break;
   default:
     return false;
   }
@@ -78,8 +81,14 @@ bool wp_ctl_request_encode(wp_ctl_request_t request, char *out,
   return n > 0 && (size_t)n < out_len;
 }
 
+bool wp_ctl_request_encode_capture(uint32_t channel, const char *path,
+                                   char *out, size_t out_len) {
+  int n = snprintf(out, out_len, "CAPTURE %u %s\n", channel, path);
+  return n > 0 && (size_t)n < out_len;
+}
+
 bool wp_ctl_request_parse(const char *line, wp_ctl_request_t *out) {
-  char buf[64];
+  char buf[WP_CTL_CAPTURE_PATH_MAX + 32];
   int n = snprintf(buf, sizeof(buf), "%s", line);
   if (n <= 0 || (size_t)n >= sizeof(buf)) {
     return false;
@@ -98,7 +107,48 @@ bool wp_ctl_request_parse(const char *line, wp_ctl_request_t *out) {
     *out = WP_CTL_REQUEST_CURSOR_POS;
   } else if (strcmp(buf, "PING") == 0) {
     *out = WP_CTL_REQUEST_PING;
+  } else if (strcmp(buf, "RENDER_NODE") == 0) {
+    *out = WP_CTL_REQUEST_RENDER_NODE;
+  } else if (strncmp(buf, "CAPTURE ", 8) == 0) {
+    *out = WP_CTL_REQUEST_CAPTURE;
   } else {
+    return false;
+  }
+  return true;
+}
+
+bool wp_ctl_capture_args_parse(const char *line, uint32_t *channel, char *path,
+                               size_t path_len) {
+  char buf[WP_CTL_CAPTURE_PATH_MAX + 32];
+  int n = snprintf(buf, sizeof(buf), "%s", line);
+  if (n <= 0 || (size_t)n >= sizeof(buf)) {
+    return false;
+  }
+  trim(buf);
+
+  if (strncmp(buf, "CAPTURE ", 8) != 0) {
+    return false;
+  }
+  const char *rest = buf + 8;
+  while (*rest == ' ' || *rest == '\t') {
+    rest++;
+  }
+  char *end = NULL;
+  errno = 0;
+  unsigned long parsed_channel = strtoul(rest, &end, 10);
+  if (end == rest || *end != ' ' || errno == ERANGE ||
+      parsed_channel > UINT32_MAX) {
+    return false;
+  }
+  while (*end == ' ' || *end == '\t') {
+    end++;
+  }
+  if (*end == '\0') {
+    return false;
+  }
+  *channel = (uint32_t)parsed_channel;
+  int path_n = snprintf(path, path_len, "%s", end);
+  if (path_n <= 0 || (size_t)path_n >= path_len) {
     return false;
   }
   return true;
@@ -126,6 +176,10 @@ bool wp_ctl_response_encode(const wp_ctl_response_t *response, char *out,
   case WP_CTL_RESPONSE_CURSOR_POS:
     n = snprintf(out, out_len, "CURSOR_POS %d %d\n", response->cursor_x,
                  response->cursor_y);
+    break;
+  case WP_CTL_RESPONSE_RENDER_NODE:
+    n = snprintf(out, out_len, "RENDER_NODE %u %u\n",
+                 response->render_node_major, response->render_node_minor);
     break;
   default:
     return false;
@@ -172,6 +226,16 @@ bool wp_ctl_response_parse(const char *line, wp_ctl_response_t *out) {
     out->tag = WP_CTL_RESPONSE_CURSOR_POS;
     out->cursor_x = x;
     out->cursor_y = y;
+    return true;
+  }
+  if (strncmp(buf, "RENDER_NODE ", 12) == 0) {
+    unsigned major, minor;
+    if (sscanf(buf + 12, "%u %u", &major, &minor) != 2) {
+      return false;
+    }
+    out->tag = WP_CTL_RESPONSE_RENDER_NODE;
+    out->render_node_major = (uint32_t)major;
+    out->render_node_minor = (uint32_t)minor;
     return true;
   }
   return false;
@@ -266,6 +330,44 @@ bool wp_send_ctl_request(const char *portal_name, wp_ctl_request_t request,
   return wp_ctl_response_parse(resp_line, out);
 }
 
+bool wp_send_ctl_capture_request(const char *portal_name, uint32_t channel,
+                                 const char *path, wp_ctl_response_t *out) {
+  char sock_path[256];
+  if (!wp_ctl_socket_path(portal_name, sock_path, sizeof(sock_path))) {
+    return false;
+  }
+
+  int sock = connect_unix_stream(sock_path);
+  if (sock < 0) {
+    return false;
+  }
+  if (!set_timeouts(sock, 10, 1)) {
+    close(sock);
+    return false;
+  }
+
+  char req_line[WP_CTL_CAPTURE_PATH_MAX + 32];
+  if (!wp_ctl_request_encode_capture(channel, path, req_line,
+                                     sizeof(req_line))) {
+    close(sock);
+    return false;
+  }
+  size_t req_len = strlen(req_line);
+  if (write(sock, req_line, req_len) != (ssize_t)req_len) {
+    close(sock);
+    return false;
+  }
+
+  char resp_line[512];
+  bool got_line = read_line(sock, resp_line, sizeof(resp_line));
+  close(sock);
+  if (!got_line) {
+    return false;
+  }
+
+  return wp_ctl_response_parse(resp_line, out);
+}
+
 #define WP_CTL_MAX_PENDING_LINE 512
 
 struct wp_ctl_listener {
@@ -281,8 +383,14 @@ struct wp_ctl_listener {
   bool has_pending;
   bool delivered;
   bool has_reply;
+  uint32_t generation;
   wp_ctl_request_t pending_request;
+  uint32_t pending_capture_channel;
+  char pending_capture_path[WP_CTL_CAPTURE_PATH_MAX];
   wp_ctl_response_t pending_reply;
+
+  int active_captures;
+  pthread_cond_t drain_cond;
 };
 
 static void *ctl_listener_thread_main(void *arg) {
@@ -315,20 +423,40 @@ static void *ctl_listener_thread_main(void *arg) {
       continue;
     }
 
+    uint32_t capture_channel = 0;
+    char capture_path[WP_CTL_CAPTURE_PATH_MAX];
+    capture_path[0] = '\0';
+    if (request == WP_CTL_REQUEST_CAPTURE &&
+        !wp_ctl_capture_args_parse(line, &capture_channel, capture_path,
+                                   sizeof(capture_path))) {
+      wp_ctl_response_t err = {.tag = WP_CTL_RESPONSE_ERR};
+      snprintf(err.err, sizeof(err.err), "%s", "malformed capture request");
+      char resp[64];
+      if (wp_ctl_response_encode(&err, resp, sizeof(resp))) {
+        write(conn, resp, strlen(resp));
+      }
+      close(conn);
+      continue;
+    }
+
     wp_ctl_response_t response;
     if (request == WP_CTL_REQUEST_CURSOR_POS && listener->cursor_fn) {
       listener->cursor_fn(listener->cursor_ctx, &response);
     } else {
       pthread_mutex_lock(&listener->mutex);
       listener->pending_request = request;
+      listener->pending_capture_channel = capture_channel;
+      snprintf(listener->pending_capture_path,
+               sizeof(listener->pending_capture_path), "%s", capture_path);
       listener->has_pending = true;
       listener->delivered = false;
       listener->has_reply = false;
+      listener->generation++;
       pthread_cond_broadcast(&listener->cond);
 
       struct timespec deadline;
       clock_gettime(CLOCK_REALTIME, &deadline);
-      deadline.tv_sec += 2;
+      deadline.tv_sec += request == WP_CTL_REQUEST_CAPTURE ? 8 : 2;
 
       while (!listener->has_reply) {
         int rc = pthread_cond_timedwait(&listener->cond, &listener->mutex,
@@ -406,12 +534,14 @@ wp_ctl_listener_t *wp_ctl_listener_start(const char *portal_name,
   listener->running = true;
   pthread_mutex_init(&listener->mutex, NULL);
   pthread_cond_init(&listener->cond, NULL);
+  pthread_cond_init(&listener->drain_cond, NULL);
 
   if (pthread_create(&listener->thread, NULL, ctl_listener_thread_main,
                      listener) != 0) {
     close(sock);
     pthread_mutex_destroy(&listener->mutex);
     pthread_cond_destroy(&listener->cond);
+    pthread_cond_destroy(&listener->drain_cond);
     free(listener);
     return NULL;
   }
@@ -427,9 +557,32 @@ void wp_ctl_listener_stop(wp_ctl_listener_t *listener) {
   shutdown(listener->listen_fd, SHUT_RDWR);
   close(listener->listen_fd);
   pthread_join(listener->thread, NULL);
+
+  pthread_mutex_lock(&listener->mutex);
+  while (listener->active_captures > 0) {
+    pthread_cond_wait(&listener->drain_cond, &listener->mutex);
+  }
+  pthread_mutex_unlock(&listener->mutex);
+
   pthread_mutex_destroy(&listener->mutex);
   pthread_cond_destroy(&listener->cond);
+  pthread_cond_destroy(&listener->drain_cond);
   free(listener);
+}
+
+void wp_ctl_listener_capture_begin(wp_ctl_listener_t *listener) {
+  pthread_mutex_lock(&listener->mutex);
+  listener->active_captures++;
+  pthread_mutex_unlock(&listener->mutex);
+}
+
+void wp_ctl_listener_capture_end(wp_ctl_listener_t *listener) {
+  pthread_mutex_lock(&listener->mutex);
+  listener->active_captures--;
+  if (listener->active_captures == 0) {
+    pthread_cond_broadcast(&listener->drain_cond);
+  }
+  pthread_mutex_unlock(&listener->mutex);
 }
 
 bool wp_ctl_listener_poll(wp_ctl_listener_t *listener,
@@ -445,11 +598,40 @@ bool wp_ctl_listener_poll(wp_ctl_listener_t *listener,
   return found;
 }
 
-void wp_ctl_listener_reply(wp_ctl_listener_t *listener,
+void wp_ctl_listener_get_capture_args(wp_ctl_listener_t *listener,
+                                      uint32_t *out_channel, char *out_path,
+                                      size_t out_path_len) {
+  pthread_mutex_lock(&listener->mutex);
+  *out_channel = listener->pending_capture_channel;
+  snprintf(out_path, out_path_len, "%s", listener->pending_capture_path);
+  pthread_mutex_unlock(&listener->mutex);
+}
+
+void wp_ctl_listener_get_capture_request(wp_ctl_listener_t *listener,
+                                         uint32_t *out_generation,
+                                         uint32_t *out_channel, char *out_path,
+                                         size_t out_path_len) {
+  pthread_mutex_lock(&listener->mutex);
+  *out_generation = listener->generation;
+  *out_channel = listener->pending_capture_channel;
+  snprintf(out_path, out_path_len, "%s", listener->pending_capture_path);
+  pthread_mutex_unlock(&listener->mutex);
+}
+
+uint32_t wp_ctl_listener_pending_generation(wp_ctl_listener_t *listener) {
+  pthread_mutex_lock(&listener->mutex);
+  uint32_t generation = listener->generation;
+  pthread_mutex_unlock(&listener->mutex);
+  return generation;
+}
+
+void wp_ctl_listener_reply(wp_ctl_listener_t *listener, uint32_t generation,
                            const wp_ctl_response_t *response) {
   pthread_mutex_lock(&listener->mutex);
-  listener->pending_reply = *response;
-  listener->has_reply = true;
-  pthread_cond_broadcast(&listener->cond);
+  if (listener->has_pending && listener->generation == generation) {
+    listener->pending_reply = *response;
+    listener->has_reply = true;
+    pthread_cond_broadcast(&listener->cond);
+  }
   pthread_mutex_unlock(&listener->mutex);
 }

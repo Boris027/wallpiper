@@ -22,6 +22,7 @@
  */
 
 #include <poll.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,11 +36,13 @@
 #include <xcb/xproto.h>
 
 #include <cJSON.h>
+#include <stb_image_write.h>
 
 #include "wallpiper/capture_socket.h"
 #include "wallpiper/ctl_protocol.h"
 #include "wallpiper/debug_overlay.h"
 #include "wallpiper/monitor_geometry.h"
+#include "wallpiper/vk_format.h"
 
 /* must match loader/vk-layer-hook/config.h */
 #define WP_I3_CAPTURE_SLOT_COUNT 3
@@ -401,12 +404,23 @@ static wp_i3_output_t *claim_output_for_size(wp_i3_state_t *state,
 }
 
 static void handle_buf(wp_i3_state_t *state, uint32_t wire_slot, uint32_t width,
-                       uint32_t height, uint32_t stride, uint64_t modifier,
-                       int fd) {
+                       uint32_t height, uint32_t format, uint32_t stride,
+                       uint64_t modifier, int fd) {
   uint32_t channel = wire_slot / WP_I3_CAPTURE_SLOT_COUNT;
   uint32_t local_idx = wire_slot % WP_I3_CAPTURE_SLOT_COUNT;
   if (channel >= WP_I3_MAX_CAPTURE_CHANNELS) {
     printf("[socket] bad wire slot %u, dropping\n", wire_slot);
+    close(fd);
+    return;
+  }
+
+  int format_matched = 0;
+  uint32_t fourcc = wp_drm_fourcc_from_vk_format(format, &format_matched);
+  if (!format_matched || fourcc != WP_DRM_FORMAT_XRGB8888) {
+    printf("[socket] VkFormat=%u on channel %u doesn't match this X server's "
+           "TrueColor visual byte order, dropping (DRI3 import can't "
+           "reinterpret channel order)\n",
+           format, channel);
     close(fd);
     return;
   }
@@ -427,10 +441,6 @@ static void handle_buf(wp_i3_state_t *state, uint32_t wire_slot, uint32_t width,
   }
 
   wp_i3_slot_t *slot = &out->slots[local_idx];
-  if (slot->in_use) {
-    xcb_free_pixmap(state->conn, slot->pixmap);
-    slot->in_use = false;
-  }
 
   xcb_pixmap_t pixmap = xcb_generate_id(state->conn);
   xcb_void_cookie_t cookie = xcb_dri3_pixmap_from_buffers_checked(
@@ -443,6 +453,10 @@ static void handle_buf(wp_i3_state_t *state, uint32_t wire_slot, uint32_t width,
     return;
   }
 
+  if (slot->in_use) {
+    xcb_free_pixmap(state->conn, slot->pixmap);
+  }
+
   slot->in_use = true;
   slot->slot = wire_slot;
   slot->pixmap = pixmap;
@@ -450,9 +464,11 @@ static void handle_buf(wp_i3_state_t *state, uint32_t wire_slot, uint32_t width,
   slot->height = height;
 
   printf("[socket] output=%s registered capture slot %u (channel=%u "
-         "local=%u) %ux%u stride=%u modifier=%llu\n",
-         out->name, wire_slot, channel, local_idx, width, height, stride,
-         (unsigned long long)modifier);
+         "local=%u) %ux%u VkFormat=%u stride=%u modifier=%llu (dri3 pixmap "
+         "import assumes the server's default 24/32-bit TrueColor visual "
+         "layout, not this format)\n",
+         out->name, wire_slot, channel, local_idx, width, height, format,
+         stride, (unsigned long long)modifier);
   set_current_source(state, out, WP_I3_SOURCE_SLOT, wire_slot);
 }
 
@@ -519,8 +535,8 @@ static void handle_capture_event(wp_i3_state_t *state,
     if (event->nfds > 1) {
       close(event->fds[1]);
     }
-    handle_buf(state, event->slot, event->width, event->height, event->stride,
-               event->modifier, image_fd);
+    handle_buf(state, event->slot, event->width, event->height, event->format,
+               event->stride, event->modifier, image_fd);
     break;
   }
   case WP_CAPTURE_EVENT_FRAME: {
@@ -594,8 +610,99 @@ static void handle_x_event(wp_i3_state_t *state, xcb_generic_event_t *event) {
   }
 }
 
+static bool capture_channel_readback(wp_i3_state_t *state, uint32_t channel,
+                                     uint8_t **out_pixels, int *out_width,
+                                     int *out_height, char *err,
+                                     size_t err_len) {
+  wp_i3_output_t *out = find_output_for_channel(state, channel);
+  if (!out || out->current_source_kind != WP_I3_SOURCE_SLOT) {
+    snprintf(err, err_len, "no active wallpaper frame on channel %u", channel);
+    return false;
+  }
+
+  uint32_t local_idx = out->current_source_slot % WP_I3_CAPTURE_SLOT_COUNT;
+  wp_i3_slot_t *slot = &out->slots[local_idx];
+  if (!slot->in_use || slot->slot != out->current_source_slot) {
+    snprintf(err, err_len, "no active wallpaper frame on channel %u", channel);
+    return false;
+  }
+
+  xcb_get_image_cookie_t cookie =
+      xcb_get_image(state->conn, XCB_IMAGE_FORMAT_Z_PIXMAP, slot->pixmap, 0, 0,
+                    (uint16_t)slot->width, (uint16_t)slot->height, ~0u);
+  xcb_generic_error_t *get_err = NULL;
+  xcb_get_image_reply_t *reply =
+      xcb_get_image_reply(state->conn, cookie, &get_err);
+  if (!reply) {
+    snprintf(err, err_len, "%s", "xcb_get_image failed");
+    free(get_err);
+    return false;
+  }
+
+  size_t expected = (size_t)slot->width * slot->height * 4;
+  uint8_t *data = xcb_get_image_data(reply);
+  size_t data_len = (size_t)xcb_get_image_data_length(reply);
+  if (data_len < expected) {
+    snprintf(err, err_len, "%s",
+             "xcb_get_image returned less data than expected");
+    free(reply);
+    return false;
+  }
+
+  uint8_t *pixels = malloc(expected);
+  if (!pixels) {
+    snprintf(err, err_len, "%s", "out of memory");
+    free(reply);
+    return false;
+  }
+
+  for (size_t i = 0; i < expected; i += 4) {
+    pixels[i + 0] = data[i + 2];
+    pixels[i + 1] = data[i + 1];
+    pixels[i + 2] = data[i + 0];
+    pixels[i + 3] = 0xff;
+  }
+  free(reply);
+
+  *out_pixels = pixels;
+  *out_width = (int)slot->width;
+  *out_height = (int)slot->height;
+  return true;
+}
+
+typedef struct {
+  uint8_t *pixels;
+  int width;
+  int height;
+  char path[WP_CTL_CAPTURE_PATH_MAX];
+  wp_ctl_listener_t *listener;
+  uint32_t generation;
+} wp_i3_capture_job_t;
+
+static void *capture_encode_and_reply(void *arg) {
+  wp_i3_capture_job_t *job = arg;
+
+  wp_ctl_response_t response;
+  memset(&response, 0, sizeof(response));
+  response.tag = WP_CTL_RESPONSE_OK;
+  if (!stbi_write_png(job->path, job->width, job->height, 4, job->pixels,
+                      job->width * 4)) {
+    response.tag = WP_CTL_RESPONSE_ERR;
+    snprintf(response.err, sizeof(response.err),
+             "failed to write PNG to %.200s", job->path);
+  }
+
+  wp_ctl_listener_reply(job->listener, job->generation, &response);
+  wp_ctl_listener_capture_end(job->listener);
+
+  free(job->pixels);
+  free(job);
+  return NULL;
+}
+
 static void handle_ctl_request(wp_i3_state_t *state, wp_ctl_request_t request,
                                wp_ctl_listener_t *listener) {
+  uint32_t generation = wp_ctl_listener_pending_generation(listener);
   wp_ctl_response_t response;
   memset(&response, 0, sizeof(response));
 
@@ -605,7 +712,7 @@ static void handle_ctl_request(wp_i3_state_t *state, wp_ctl_request_t request,
     // response.geometry = state->geometry;
     response.tag = WP_CTL_RESPONSE_ERR;
     snprintf(response.err, sizeof(response.err), "%s",
-            "geometry detection disabled");
+             "geometry detection disabled");
     break;
   case WP_CTL_REQUEST_DETACH:
     detach(state);
@@ -627,13 +734,57 @@ static void handle_ctl_request(wp_i3_state_t *state, wp_ctl_request_t request,
   case WP_CTL_REQUEST_PING:
     response.tag = WP_CTL_RESPONSE_OK;
     break;
+  case WP_CTL_REQUEST_CAPTURE: {
+    uint32_t channel = 0;
+    char path[WP_CTL_CAPTURE_PATH_MAX];
+    wp_ctl_listener_get_capture_request(listener, &generation, &channel, path,
+                                        sizeof(path));
+
+    uint8_t *pixels = NULL;
+    int width = 0, height = 0;
+    if (!capture_channel_readback(state, channel, &pixels, &width, &height,
+                                  response.err, sizeof(response.err))) {
+      response.tag = WP_CTL_RESPONSE_ERR;
+      break;
+    }
+
+    wp_i3_capture_job_t *job = malloc(sizeof(*job));
+    if (!job) {
+      free(pixels);
+      response.tag = WP_CTL_RESPONSE_ERR;
+      snprintf(response.err, sizeof(response.err), "%s", "out of memory");
+      break;
+    }
+    job->pixels = pixels;
+    job->width = width;
+    job->height = height;
+    snprintf(job->path, sizeof(job->path), "%s", path);
+    job->listener = listener;
+    job->generation = generation;
+
+    wp_ctl_listener_capture_begin(job->listener);
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, capture_encode_and_reply, job) != 0) {
+      wp_ctl_listener_capture_end(job->listener);
+      free(pixels);
+      free(job);
+      response.tag = WP_CTL_RESPONSE_ERR;
+      snprintf(response.err, sizeof(response.err), "%s",
+               "failed to spawn capture encode thread");
+      break;
+    }
+    pthread_detach(thread);
+    /* The worker thread replies once the PNG is written -- don't fall
+     * through to the trailing wp_ctl_listener_reply() below. */
+    return;
+  }
   default:
     response.tag = WP_CTL_RESPONSE_ERR;
     snprintf(response.err, sizeof(response.err), "%s", "unrecognized command");
     break;
   }
 
-  wp_ctl_listener_reply(listener, &response);
+  wp_ctl_listener_reply(listener, generation, &response);
 }
 
 int main(void) {

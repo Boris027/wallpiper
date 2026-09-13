@@ -25,6 +25,8 @@
 
 #include "capture_coordinator.h"
 
+#include <wallpiper/vk_format.h>
+
 #include <QDateTime>
 #include <QDebug>
 #include <QGuiApplication>
@@ -32,12 +34,16 @@
 #include <QOpenGLContext>
 #include <QOpenGLExtraFunctions>
 #include <QOpenGLFunctions>
+#include <QQuickGraphicsConfiguration>
 #include <QQuickWindow>
+#include <QSGRendererInterface>
 #include <QSGSimpleTextureNode>
 #include <QScreen>
+#include <QVulkanInstance>
 
 #include <algorithm>
 #include <cmath>
+#include <thread>
 
 #include <sys/mman.h>
 #include <unistd.h>
@@ -61,9 +67,10 @@ bool ensureBlitProgram(QOpenGLExtraFunctions *gl, BlitProgramState &state,
                         "  uv = pos * 0.5 + 0.5;\n"
                         "  gl_Position = vec4(pos, 0.0, 1.0);\n"
                         "}\n";
-    const char *fsSrc = "#extension GL_OES_EGL_image_external : require\n"
+    const char *fsSrc = "#ifdef GL_ES\n"
                         "precision mediump float;\n"
-                        "uniform samplerExternalOES tex;\n"
+                        "#endif\n"
+                        "uniform sampler2D tex;\n"
                         "varying vec2 uv;\n"
                         "void main() {\n"
                         "  gl_FragColor = texture2D(tex, uv);\n"
@@ -200,6 +207,41 @@ void WallpaperCaptureItem::componentComplete() {
     if (win) {
       connect(win, &QQuickWindow::screenChanged, this,
               [] { CaptureCoordinator::instance()->reevaluateActiveItem(); });
+      if (!win->isSceneGraphInitialized()) {
+        auto config = win->graphicsConfiguration();
+        config.setDeviceExtensions({
+            "VK_KHR_external_memory",
+            "VK_KHR_external_memory_fd",
+            "VK_EXT_external_memory_dma_buf",
+            "VK_EXT_queue_family_foreign",
+            "VK_EXT_image_drm_format_modifier",
+            "VK_KHR_external_semaphore",
+            "VK_KHR_external_semaphore_fd",
+        });
+        win->setGraphicsConfiguration(config);
+
+        if (!win->vulkanInstance()) {
+          static QVulkanInstance s_vulkanInstance;
+          if (!s_vulkanInstance.isValid()) {
+            QByteArrayList extensions =
+                QQuickGraphicsConfiguration::preferredInstanceExtensions();
+            if (s_vulkanInstance.supportedExtensions().contains(
+                    "VK_EXT_physical_device_drm") &&
+                !extensions.contains("VK_EXT_physical_device_drm")) {
+              extensions.append("VK_EXT_physical_device_drm");
+            }
+            s_vulkanInstance.setExtensions(extensions);
+            if (!s_vulkanInstance.create()) {
+              qWarning() << "[vulkan] failed to create QVulkanInstance with"
+                        << extensions << "- falling back to Qt Quick's "
+                        "default instance";
+            }
+          }
+          if (s_vulkanInstance.isValid()) {
+            win->setVulkanInstance(&s_vulkanInstance);
+          }
+        }
+      }
     }
     CaptureCoordinator::instance()->reevaluateActiveItem();
   });
@@ -226,10 +268,18 @@ void WallpaperCaptureItem::requestUpdate() {
 }
 
 void WallpaperCaptureItem::stageBuf(quint32 slot, quint32 width, quint32 height,
-                                    quint32 stride, quint64 modifier, int fd,
-                                    int syncFd) {
+                                    quint32 format, quint32 stride,
+                                    quint64 modifier, int fd, int syncFd) {
+  if (!m_loggedFormat || *m_loggedFormat != format) {
+    m_loggedFormat = format;
+    int matched = 0;
+    uint32_t fourcc = wp_drm_fourcc_from_vk_format(format, &matched);
+    qInfo() << "[capture] wallpaper buffer VkFormat" << format
+            << "mapped to DRM fourcc" << Qt::hex << fourcc
+            << (matched ? "(known mapping)" : "(unrecognized, defaulting)");
+  }
   m_pendingBufs.push_back(
-      PendingBuf{slot, width, height, stride, modifier, fd});
+      PendingBuf{slot, width, height, format, stride, modifier, fd});
   replacePendingSource(PendingSource{false, slot, syncFd});
   recordCapture();
   requestUpdate();
@@ -273,6 +323,17 @@ void WallpaperCaptureItem::requestDetach() {
   requestUpdate();
 }
 
+std::shared_ptr<CaptureCompletion>
+WallpaperCaptureItem::beginCapture(const QString &path) {
+  auto completion = std::make_shared<CaptureCompletion>();
+  {
+    std::lock_guard<std::mutex> lock(m_pendingCaptureMutex);
+    m_pendingCapture = PendingCapture{path, completion};
+  }
+  requestUpdate();
+  return completion;
+}
+
 void WallpaperCaptureItem::setDebugEnabled(bool enabled) {
   if (m_debugEnabled == enabled) {
     return;
@@ -305,12 +366,28 @@ WallpaperCaptureItem::currentGeometry() const {
   return result;
 }
 
+bool WallpaperCaptureItem::queryRenderNode(uint32_t *major,
+                                           uint32_t *minor) const {
+  if (m_backend == Backend::Vulkan) {
+    return m_vkImporter.queryRenderNode(major, minor);
+  }
+  if (m_backend == Backend::Egl) {
+    return m_importer.queryRenderNode(major, minor);
+  }
+  return false;
+}
+
 void WallpaperCaptureItem::destroySlot(quint32 slot) {
   auto it = m_slotTextures.find(slot);
   if (it == m_slotTextures.end()) {
     return;
   }
-  m_importer.destroyImport(it->second.import);
+  if (it->second.eglImport) {
+    m_importer.destroyImport(*it->second.eglImport);
+  }
+  if (it->second.vkImport) {
+    m_vkImporter.destroyImport(*it->second.vkImport);
+  }
   if (auto *ctx = QOpenGLContext::currentContext()) {
     auto *gl = ctx->functions();
     if (it->second.blitTexture) {
@@ -328,30 +405,37 @@ void WallpaperCaptureItem::destroySlot(quint32 slot) {
 
 bool WallpaperCaptureItem::reimportSlot(quint32 slot) {
   auto it = m_slotTextures.find(slot);
-  if (it == m_slotTextures.end() || it->second.memFd < 0) {
+  if (it == m_slotTextures.end() || !it->second.eglImport ||
+      it->second.memFd < 0) {
     return false;
   }
   int dupFd = ::dup(it->second.memFd);
   if (dupFd < 0) {
     return false;
   }
+  uint32_t fourcc = wp_drm_fourcc_from_vk_format(it->second.format, nullptr);
   auto newImage = m_importer.createImageOnly(
       static_cast<int>(it->second.width), static_cast<int>(it->second.height),
-      it->second.stride, it->second.modifier, dupFd);
+      it->second.stride, it->second.modifier, fourcc, dupFd);
   if (!newImage) {
     qWarning() << "[capture] dmabuf image refresh failed for slot" << slot;
     return false;
   }
 
-  m_importer.destroyEglImage(it->second.import.image);
-  it->second.import.image = *newImage;
+  m_importer.destroyEglImage(it->second.eglImport->image);
+  it->second.eglImport->image = *newImage;
   return true;
 }
 
 void WallpaperCaptureItem::destroyAllSlots() {
   auto *ctx = QOpenGLContext::currentContext();
   for (auto &[slot, tex] : m_slotTextures) {
-    m_importer.destroyImport(tex.import);
+    if (tex.eglImport) {
+      m_importer.destroyImport(*tex.eglImport);
+    }
+    if (tex.vkImport) {
+      m_vkImporter.destroyImport(*tex.vkImport);
+    }
     if (ctx) {
       auto *gl = ctx->functions();
       if (tex.blitTexture) {
@@ -425,8 +509,21 @@ QSGNode *WallpaperCaptureItem::updatePaintNode(QSGNode *oldNode,
   }
 
   auto *win = window();
+  if (win && m_backend == Backend::None) {
+    auto *rif = win->rendererInterface();
+    auto api = rif ? rif->graphicsApi() : QSGRendererInterface::Unknown;
+    if (api == QSGRendererInterface::OpenGL) {
+      m_backend = Backend::Egl;
+    } else if (api == QSGRendererInterface::Vulkan) {
+      m_backend = Backend::Vulkan;
+    }
+  }
   if (win) {
-    m_importer.ensureBound(win);
+    if (m_backend == Backend::Egl) {
+      m_importer.ensureBound(win);
+    } else if (m_backend == Backend::Vulkan) {
+      m_vkImporter.ensureBound(win);
+    }
   }
 
   std::unordered_map<quint32, bool> freshlyImported;
@@ -434,58 +531,90 @@ QSGNode *WallpaperCaptureItem::updatePaintNode(QSGNode *oldNode,
     PendingBuf pending = m_pendingBufs.front();
     m_pendingBufs.pop_front();
 
-    destroySlot(pending.slot);
+    SlotTexture tex;
+    tex.width = pending.width;
+    tex.height = pending.height;
+    tex.format = pending.format;
+    tex.stride = pending.stride;
+    tex.modifier = pending.modifier;
 
-    int retainedFd = ::dup(pending.fd);
-    auto imported = m_importer.importDmabuf(
-        static_cast<int>(pending.width), static_cast<int>(pending.height),
-        pending.stride, pending.modifier, pending.fd);
-    if (!imported) {
-      qWarning() << "[capture] dmabuf import failed for slot" << pending.slot;
-      if (retainedFd >= 0) {
-        ::close(retainedFd);
+    bool imported = false;
+    if (m_backend == Backend::Vulkan) {
+      auto vkImported = m_vkImporter.importDmabuf(
+          static_cast<int>(pending.width), static_cast<int>(pending.height),
+          pending.stride, pending.modifier,
+          static_cast<VkFormat>(pending.format), pending.fd);
+      if (vkImported) {
+        tex.vkImport = *vkImported;
+        tex.sgTexture.reset(m_vkImporter.wrapTexture2D(
+            win, *tex.vkImport,
+            QSize(static_cast<int>(pending.width),
+                 static_cast<int>(pending.height))));
+        imported = true;
+      } else {
+        qWarning() << "[capture] Vulkan dmabuf import failed for slot"
+                   << pending.slot << "(VkFormat" << pending.format << ")";
       }
+    } else {
+      uint32_t fourcc = wp_drm_fourcc_from_vk_format(pending.format, nullptr);
+      int retainedFd = ::dup(pending.fd);
+      auto eglImported = m_importer.importDmabuf(
+          static_cast<int>(pending.width), static_cast<int>(pending.height),
+          pending.stride, pending.modifier, fourcc, pending.fd);
+      if (!eglImported) {
+        qWarning() << "[capture] dmabuf import failed for slot"
+                   << pending.slot << "(VkFormat" << pending.format
+                   << "-> fourcc" << Qt::hex << fourcc << Qt::dec << ")";
+        if (retainedFd >= 0) {
+          ::close(retainedFd);
+        }
+      } else {
+        tex.eglImport = *eglImported;
+        tex.memFd = retainedFd;
+
+        if (auto *ctx = QOpenGLContext::currentContext()) {
+          auto *gl = ctx->extraFunctions();
+          gl->glGenTextures(1, &tex.blitTexture);
+          gl->glBindTexture(GL_TEXTURE_2D, tex.blitTexture);
+          gl->glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA,
+                           static_cast<int>(pending.width),
+                           static_cast<int>(pending.height), 0, GL_RGBA,
+                           GL_UNSIGNED_BYTE, nullptr);
+          gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                              GL_LINEAR);
+          gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
+                              GL_LINEAR);
+          gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+                              GL_CLAMP_TO_EDGE);
+          gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+                              GL_CLAMP_TO_EDGE);
+          gl->glBindTexture(GL_TEXTURE_2D, 0);
+
+          gl->glGenFramebuffers(1, &tex.blitFbo);
+          gl->glBindFramebuffer(GL_FRAMEBUFFER, tex.blitFbo);
+          gl->glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                     GL_TEXTURE_2D, tex.blitTexture, 0);
+          gl->glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+          blitExternalOesToTexture2D(
+              gl, m_blitProgram, tex.eglImport->texture, tex.blitFbo,
+              static_cast<int>(pending.width),
+              static_cast<int>(pending.height));
+
+          tex.sgTexture.reset(m_importer.wrapTexture2D(
+              win, tex.blitTexture,
+              QSize(static_cast<int>(pending.width),
+                   static_cast<int>(pending.height))));
+        }
+        imported = true;
+      }
+    }
+
+    if (!imported) {
       continue;
     }
 
-    SlotTexture tex;
-    tex.import = *imported;
-    tex.width = pending.width;
-    tex.height = pending.height;
-    tex.stride = pending.stride;
-    tex.modifier = pending.modifier;
-    tex.memFd = retainedFd;
-
-    if (auto *ctx = QOpenGLContext::currentContext()) {
-      auto *gl = ctx->extraFunctions();
-      gl->glGenTextures(1, &tex.blitTexture);
-      gl->glBindTexture(GL_TEXTURE_2D, tex.blitTexture);
-      gl->glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA,
-                       static_cast<int>(pending.width),
-                       static_cast<int>(pending.height), 0, GL_RGBA,
-                       GL_UNSIGNED_BYTE, nullptr);
-      gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-      gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-      gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-      gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-      gl->glBindTexture(GL_TEXTURE_2D, 0);
-
-      gl->glGenFramebuffers(1, &tex.blitFbo);
-      gl->glBindFramebuffer(GL_FRAMEBUFFER, tex.blitFbo);
-      gl->glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                                 GL_TEXTURE_2D, tex.blitTexture, 0);
-      gl->glBindFramebuffer(GL_FRAMEBUFFER, 0);
-
-      blitExternalOesToTexture2D(gl, m_blitProgram, tex.import.texture,
-                                 tex.blitFbo, static_cast<int>(pending.width),
-                                 static_cast<int>(pending.height));
-
-      tex.sgTexture.reset(
-          m_importer.wrapTexture2D(win, tex.blitTexture,
-                                   QSize(static_cast<int>(pending.width),
-                                         static_cast<int>(pending.height))));
-    }
-
+    destroySlot(pending.slot);
     m_slotTextures.emplace(pending.slot, std::move(tex));
     freshlyImported[pending.slot] = true;
   }
@@ -523,32 +652,102 @@ QSGNode *WallpaperCaptureItem::updatePaintNode(QSGNode *oldNode,
   }
 
   QSGTexture *texture = nullptr;
+  GLuint captureFbo = 0;
+  int captureWidth = 0;
+  int captureHeight = 0;
+  bool captureAvailable = false;
   if (m_currentIsShm) {
     texture = m_shmTexture.get();
   } else if (m_currentSlot) {
     auto it = m_slotTextures.find(*m_currentSlot);
     if (it != m_slotTextures.end()) {
       if (haveNewFrame) {
-        m_importer.waitForSyncFd(newFrameSyncFd);
-        if (!freshlyImported.count(*m_currentSlot)) {
-          reimportSlot(*m_currentSlot);
-          it = m_slotTextures.find(*m_currentSlot);
-        }
-        m_importer.refreshBinding(it->second.import);
-        if (auto *ctx = QOpenGLContext::currentContext()) {
-          auto *gl = ctx->extraFunctions();
-          blitExternalOesToTexture2D(
-              gl, m_blitProgram, it->second.import.texture, it->second.blitFbo,
-              static_cast<int>(it->second.width),
-              static_cast<int>(it->second.height));
+        if (it->second.vkImport) {
+          m_vkImporter.blitFrame(*it->second.vkImport, newFrameSyncFd);
+        } else if (it->second.eglImport) {
+          m_importer.waitForSyncFd(newFrameSyncFd);
+          if (!freshlyImported.count(*m_currentSlot)) {
+            reimportSlot(*m_currentSlot);
+            it = m_slotTextures.find(*m_currentSlot);
+          }
+          m_importer.refreshBinding(*it->second.eglImport);
+          if (auto *ctx = QOpenGLContext::currentContext()) {
+            auto *gl = ctx->extraFunctions();
+            blitExternalOesToTexture2D(
+                gl, m_blitProgram, it->second.eglImport->texture,
+                it->second.blitFbo, static_cast<int>(it->second.width),
+                static_cast<int>(it->second.height));
+          }
+        } else if (newFrameSyncFd >= 0) {
+          ::close(newFrameSyncFd);
         }
       }
       texture = it->second.sgTexture.get();
+      captureFbo = it->second.blitFbo;
+      captureWidth = static_cast<int>(it->second.width);
+      captureHeight = static_cast<int>(it->second.height);
+      captureAvailable = captureFbo != 0;
     } else if (haveNewFrame && newFrameSyncFd >= 0) {
       ::close(newFrameSyncFd);
     }
   } else if (haveNewFrame && newFrameSyncFd >= 0) {
     ::close(newFrameSyncFd);
+  }
+
+  std::optional<PendingCapture> pendingCapture;
+  {
+    std::lock_guard<std::mutex> lock(m_pendingCaptureMutex);
+    pendingCapture = m_pendingCapture;
+    m_pendingCapture.reset();
+  }
+  if (pendingCapture) {
+    const QString &capturePath = pendingCapture->path;
+    const auto &completion = pendingCapture->completion;
+    bool ok = false;
+    QString captureErr;
+    QImage image;
+    if (!captureAvailable && m_backend == Backend::Vulkan) {
+      captureErr =
+          QStringLiteral("capture is not supported on the Vulkan backend yet");
+    } else if (!captureAvailable) {
+      captureErr = QStringLiteral("no active wallpaper frame to capture");
+    } else if (auto *ctx = QOpenGLContext::currentContext()) {
+      auto *gl = ctx->extraFunctions();
+      image = QImage(captureWidth, captureHeight, QImage::Format_RGBA8888);
+      GLint prevFbo = 0;
+      gl->glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFbo);
+      gl->glBindFramebuffer(GL_FRAMEBUFFER, captureFbo);
+      gl->glReadPixels(0, 0, captureWidth, captureHeight, GL_RGBA,
+                       GL_UNSIGNED_BYTE, image.bits());
+      gl->glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(prevFbo));
+      image = image.mirrored(false, true);
+      ok = true;
+    } else {
+      captureErr = QStringLiteral("no OpenGL context on render thread");
+    }
+
+    if (ok) {
+      std::thread([image, capturePath, completion]() mutable {
+        bool saved = image.save(capturePath, "PNG");
+        QString err;
+        if (!saved) {
+          err = QStringLiteral("failed to write PNG to %1").arg(capturePath);
+        }
+        {
+          std::lock_guard<std::mutex> lock(completion->mutex);
+          completion->ok = saved;
+          completion->err = err;
+          completion->done = true;
+        }
+        completion->cv.notify_all();
+      }).detach();
+    } else {
+      std::lock_guard<std::mutex> lock(completion->mutex);
+      completion->ok = false;
+      completion->err = captureErr;
+      completion->done = true;
+      completion->cv.notify_all();
+    }
   }
 
   if (!texture) {

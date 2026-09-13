@@ -26,11 +26,28 @@
 #include "logging.h"
 #include "process.h"
 
+#include <inttypes.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include <vulkan/vk_layer.h>
+
+#ifndef VK_EXT_physical_device_drm
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT                   \
+  ((VkStructureType)1000353000)
+typedef struct VkPhysicalDeviceDrmPropertiesEXT {
+  VkStructureType sType;
+  void *pNext;
+  VkBool32 hasPrimary;
+  VkBool32 hasRender;
+  int64_t primaryMajor;
+  int64_t primaryMinor;
+  int64_t renderMajor;
+  int64_t renderMinor;
+} VkPhysicalDeviceDrmPropertiesEXT;
+#endif
 
 typedef struct {
   VkStructureType sType;
@@ -95,6 +112,12 @@ static const char *const REQUIRED_DEVICE_EXTENSIONS[] = {
 #define REQUIRED_DEVICE_EXTENSION_COUNT                                        \
   (sizeof(REQUIRED_DEVICE_EXTENSIONS) / sizeof(REQUIRED_DEVICE_EXTENSIONS[0]))
 
+static const char *const REQUIRED_INSTANCE_EXTENSIONS[] = {
+    "VK_EXT_physical_device_drm",
+};
+#define REQUIRED_INSTANCE_EXTENSION_COUNT                                      \
+  (sizeof(REQUIRED_INSTANCE_EXTENSIONS) / sizeof(REQUIRED_INSTANCE_EXTENSIONS[0]))
+
 static VkInstance g_instance = VK_NULL_HANDLE;
 static PFN_vkGetInstanceProcAddr g_next_gipa = NULL;
 static PFN_vkDestroyInstance g_next_destroy_instance = NULL;
@@ -102,6 +125,13 @@ static PFN_vkGetPhysicalDeviceMemoryProperties
     g_get_physical_device_memory_properties = NULL;
 static PFN_vkGetPhysicalDeviceFormatProperties2
     g_get_physical_device_format_properties2 = NULL;
+static PFN_vkGetPhysicalDeviceProperties2 g_get_physical_device_properties2 =
+    NULL;
+static PFN_vkGetPhysicalDeviceProperties g_get_physical_device_properties =
+    NULL;
+static PFN_vkEnumeratePhysicalDevices g_next_enumerate_physical_devices = NULL;
+static PFN_vkEnumeratePhysicalDeviceGroups
+    g_next_enumerate_physical_device_groups = NULL;
 static PFN_wp_vkCreateXlibSurfaceKHR g_next_create_xlib_surface_khr = NULL;
 
 void wp_global_instance_set(VkInstance instance,
@@ -119,8 +149,158 @@ void wp_global_instance_set(VkInstance instance,
   g_get_physical_device_format_properties2 =
       (PFN_vkGetPhysicalDeviceFormatProperties2)next_gipa(
           instance, "vkGetPhysicalDeviceFormatProperties2");
+  g_get_physical_device_properties2 =
+      (PFN_vkGetPhysicalDeviceProperties2)next_gipa(
+          instance, "vkGetPhysicalDeviceProperties2");
+  g_get_physical_device_properties =
+      (PFN_vkGetPhysicalDeviceProperties)next_gipa(
+          instance, "vkGetPhysicalDeviceProperties");
+  g_next_enumerate_physical_devices = (PFN_vkEnumeratePhysicalDevices)next_gipa(
+      instance, "vkEnumeratePhysicalDevices");
+  g_next_enumerate_physical_device_groups =
+      (PFN_vkEnumeratePhysicalDeviceGroups)next_gipa(
+          instance, "vkEnumeratePhysicalDeviceGroups");
+  if (!g_next_enumerate_physical_device_groups) {
+    /* pre-1.1 instances that only enabled VK_KHR_device_group_creation */
+    g_next_enumerate_physical_device_groups =
+        (PFN_vkEnumeratePhysicalDeviceGroups)next_gipa(
+            instance, "vkEnumeratePhysicalDeviceGroupsKHR");
+  }
   g_next_create_xlib_surface_khr = (PFN_wp_vkCreateXlibSurfaceKHR)next_gipa(
       instance, "vkCreateXlibSurfaceKHR");
+}
+
+/* Parses "major:minor" (e.g. "226:1") */
+static bool parse_preferred_render_node(int64_t *out_major,
+                                        int64_t *out_minor) {
+  const char *env = getenv("WALLPIPER_CAPTURE_RENDER_NODE");
+  if (!env || !env[0]) {
+    return false;
+  }
+  long long major = 0, minor = 0;
+  if (sscanf(env, "%lld:%lld", &major, &minor) != 2) {
+    return false;
+  }
+  *out_major = (int64_t)major;
+  *out_minor = (int64_t)minor;
+  return true;
+}
+
+/* best effort */
+static bool query_render_node(VkPhysicalDevice pd,
+                              VkPhysicalDeviceDrmPropertiesEXT *out) {
+  if (!g_get_physical_device_properties2) {
+    return false;
+  }
+  memset(out, 0, sizeof(*out));
+  out->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT;
+  VkPhysicalDeviceProperties2 props2 = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+      .pNext = out,
+  };
+  g_get_physical_device_properties2(pd, &props2);
+  return out->hasRender;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+wp_EnumeratePhysicalDevices(VkInstance instance, uint32_t *pPhysicalDeviceCount,
+                            VkPhysicalDevice *pPhysicalDevices) {
+  if (!g_next_enumerate_physical_devices) {
+    return VK_ERROR_INITIALIZATION_FAILED;
+  }
+  VkResult res = g_next_enumerate_physical_devices(
+      instance, pPhysicalDeviceCount, pPhysicalDevices);
+  if (res != VK_SUCCESS && res != VK_INCOMPLETE) {
+    return res;
+  }
+  if (!pPhysicalDevices || !wp_capture_is_target_process()) {
+    return res;
+  }
+
+  int64_t want_major = 0, want_minor = 0;
+  if (!parse_preferred_render_node(&want_major, &want_minor)) {
+    return res;
+  }
+
+  uint32_t count = *pPhysicalDeviceCount;
+  bool found_preferred = false;
+  for (uint32_t i = 0; i < count; i++) {
+    VkPhysicalDeviceDrmPropertiesEXT drm;
+    if (!query_render_node(pPhysicalDevices[i], &drm)) {
+      continue;
+    }
+    if (drm.renderMajor != want_major || drm.renderMinor != want_minor) {
+      continue;
+    }
+    pPhysicalDevices[0] = pPhysicalDevices[i];
+    *pPhysicalDeviceCount = 1;
+    found_preferred = true;
+    WP_LOG("enumerate_physical_devices: restricting target process to "
+           "render node %lld:%lld (was index %u)",
+           (long long)want_major, (long long)want_minor, i);
+    break;
+  }
+
+  if (!found_preferred) {
+    WP_LOG("enumerate_physical_devices: no enumerated device matches "
+           "WALLPIPER_CAPTURE_RENDER_NODE=%lld:%lld, leaving order unchanged",
+           (long long)want_major, (long long)want_minor);
+  }
+  return res;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL wp_EnumeratePhysicalDeviceGroups(
+    VkInstance instance, uint32_t *pPhysicalDeviceGroupCount,
+    VkPhysicalDeviceGroupProperties *pPhysicalDeviceGroupProperties) {
+  if (!g_next_enumerate_physical_device_groups) {
+    return VK_ERROR_INITIALIZATION_FAILED;
+  }
+  VkResult res = g_next_enumerate_physical_device_groups(
+      instance, pPhysicalDeviceGroupCount, pPhysicalDeviceGroupProperties);
+  if (res != VK_SUCCESS && res != VK_INCOMPLETE) {
+    return res;
+  }
+  if (!pPhysicalDeviceGroupProperties || !wp_capture_is_target_process()) {
+    return res;
+  }
+
+  int64_t want_major = 0, want_minor = 0;
+  if (!parse_preferred_render_node(&want_major, &want_minor)) {
+    return res;
+  }
+
+  uint32_t count = *pPhysicalDeviceGroupCount;
+  bool found_preferred = false;
+  for (uint32_t i = 0; i < count && !found_preferred; i++) {
+    VkPhysicalDeviceGroupProperties *group =
+        &pPhysicalDeviceGroupProperties[i];
+    for (uint32_t d = 0; d < group->physicalDeviceCount; d++) {
+      VkPhysicalDeviceDrmPropertiesEXT drm;
+      if (!query_render_node(group->physicalDevices[d], &drm)) {
+        continue;
+      }
+      if (drm.renderMajor != want_major || drm.renderMinor != want_minor) {
+        continue;
+      }
+      VkPhysicalDevice matched = group->physicalDevices[d];
+      pPhysicalDeviceGroupProperties[0] = *group;
+      pPhysicalDeviceGroupProperties[0].physicalDeviceCount = 1;
+      pPhysicalDeviceGroupProperties[0].physicalDevices[0] = matched;
+      *pPhysicalDeviceGroupCount = 1;
+      found_preferred = true;
+      WP_LOG("enumerate_physical_device_groups: restricting target process "
+             "to render node %lld:%lld (was group index %u)",
+             (long long)want_major, (long long)want_minor, i);
+      break;
+    }
+  }
+
+  if (!found_preferred) {
+    WP_LOG("enumerate_physical_device_groups: no group matches "
+           "WALLPIPER_CAPTURE_RENDER_NODE=%lld:%lld, leaving order unchanged",
+           (long long)want_major, (long long)want_minor);
+  }
+  return res;
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL wp_CreateXlibSurfaceKHR(
@@ -183,7 +363,73 @@ VKAPI_ATTR VkResult VKAPI_CALL wp_CreateInstance(
     return VK_ERROR_INITIALIZATION_FAILED;
   }
 
-  VkResult res = next_create_instance(pCreateInfo, pAllocator, pInstance);
+  VkInstanceCreateInfo modified_info = *pCreateInfo;
+  const char **extension_ptrs = NULL;
+  VkExtensionProperties *available_extensions = NULL;
+
+  if (wp_capture_is_target_process()) {
+    PFN_vkEnumerateInstanceExtensionProperties enumerate_instance_extensions =
+        (PFN_vkEnumerateInstanceExtensionProperties)next_gipa(
+            NULL, "vkEnumerateInstanceExtensionProperties");
+    uint32_t available_count = 0;
+    if (enumerate_instance_extensions &&
+        enumerate_instance_extensions(NULL, &available_count, NULL) ==
+            VK_SUCCESS &&
+        available_count > 0) {
+      available_extensions =
+          malloc(available_count * sizeof(*available_extensions));
+      if (available_extensions &&
+          enumerate_instance_extensions(NULL, &available_count,
+                                        available_extensions) != VK_SUCCESS) {
+        free(available_extensions);
+        available_extensions = NULL;
+        available_count = 0;
+      }
+    }
+
+    if (available_extensions) {
+      size_t base_count = pCreateInfo->enabledExtensionCount;
+      size_t max_count = base_count + REQUIRED_INSTANCE_EXTENSION_COUNT;
+      extension_ptrs = malloc(max_count * sizeof(const char *));
+      if (extension_ptrs) {
+        size_t n = 0;
+        for (size_t i = 0; i < base_count; i++) {
+          extension_ptrs[n++] = pCreateInfo->ppEnabledExtensionNames[i];
+        }
+        for (size_t r = 0; r < REQUIRED_INSTANCE_EXTENSION_COUNT; r++) {
+          bool present = false;
+          for (size_t i = 0; i < base_count; i++) {
+            if (strcmp(pCreateInfo->ppEnabledExtensionNames[i],
+                       REQUIRED_INSTANCE_EXTENSIONS[r]) == 0) {
+              present = true;
+              break;
+            }
+          }
+          if (present) {
+            continue;
+          }
+          bool supported = false;
+          for (uint32_t a = 0; a < available_count; a++) {
+            if (strcmp(available_extensions[a].extensionName,
+                       REQUIRED_INSTANCE_EXTENSIONS[r]) == 0) {
+              supported = true;
+              break;
+            }
+          }
+          if (supported) {
+            extension_ptrs[n++] = REQUIRED_INSTANCE_EXTENSIONS[r];
+          }
+        }
+        modified_info.enabledExtensionCount = (uint32_t)n;
+        modified_info.ppEnabledExtensionNames = extension_ptrs;
+      }
+    }
+  }
+
+  VkResult res =
+      next_create_instance(&modified_info, pAllocator, pInstance);
+  free(extension_ptrs);
+  free(available_extensions);
   if (res != VK_SUCCESS) {
     return res;
   }
@@ -203,6 +449,10 @@ VKAPI_ATTR void VKAPI_CALL wp_DestroyInstance(
     g_next_destroy_instance = NULL;
     g_get_physical_device_memory_properties = NULL;
     g_get_physical_device_format_properties2 = NULL;
+    g_get_physical_device_properties2 = NULL;
+    g_get_physical_device_properties = NULL;
+    g_next_enumerate_physical_devices = NULL;
+    g_next_enumerate_physical_device_groups = NULL;
     g_next_create_xlib_surface_khr = NULL;
   }
 }
@@ -275,6 +525,24 @@ VKAPI_ATTR VkResult VKAPI_CALL wp_CreateDevice(
     return res;
   }
 
+  if (wp_capture_is_target_process() && g_get_physical_device_properties) {
+    VkPhysicalDeviceDrmPropertiesEXT drm;
+    bool has_render_node = query_render_node(physicalDevice, &drm);
+    VkPhysicalDeviceProperties props;
+    g_get_physical_device_properties(physicalDevice, &props);
+    if (has_render_node) {
+      WP_LOG("create_device: physical device \"%s\" (vendor=0x%04x "
+             "device=0x%04x) render node=%" PRId64 ":%" PRId64,
+             props.deviceName, props.vendorID, props.deviceID, drm.renderMajor,
+             drm.renderMinor);
+    } else {
+      WP_LOG("create_device: physical device \"%s\" (vendor=0x%04x "
+             "device=0x%04x) render node unavailable "
+             "(no VK_EXT_physical_device_drm)",
+             props.deviceName, props.vendorID, props.deviceID);
+    }
+  }
+
   wp_device_data_t *data =
       wp_device_data_create(*pDevice, physicalDevice, next_gdpa);
   if (!data) {
@@ -310,6 +578,12 @@ vkGetInstanceProcAddr(VkInstance instance, const char *pName) {
       {"vkCreateInstance", (PFN_vkVoidFunction)wp_CreateInstance},
       {"vkDestroyInstance", (PFN_vkVoidFunction)wp_DestroyInstance},
       {"vkCreateDevice", (PFN_vkVoidFunction)wp_CreateDevice},
+      {"vkEnumeratePhysicalDevices",
+       (PFN_vkVoidFunction)wp_EnumeratePhysicalDevices},
+      {"vkEnumeratePhysicalDeviceGroups",
+       (PFN_vkVoidFunction)wp_EnumeratePhysicalDeviceGroups},
+      {"vkEnumeratePhysicalDeviceGroupsKHR",
+       (PFN_vkVoidFunction)wp_EnumeratePhysicalDeviceGroups},
       {"vkGetDeviceProcAddr", (PFN_vkVoidFunction)vkGetDeviceProcAddr},
       {"vkCreateXlibSurfaceKHR", (PFN_vkVoidFunction)wp_CreateXlibSurfaceKHR},
   };

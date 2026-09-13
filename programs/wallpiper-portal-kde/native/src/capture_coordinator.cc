@@ -26,6 +26,7 @@
 #include "capture_item.h"
 #include "capture_socket.h"
 #include "ctl_listener.h"
+#include "x11_output_lookup.h"
 
 #include <QCursor>
 #include <QDebug>
@@ -34,7 +35,11 @@
 #include <QTimer>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
 
 #include <unistd.h>
 
@@ -42,6 +47,7 @@ namespace WallpiperKde {
 
 namespace {
 constexpr int kCursorSampleIntervalMs = 8;
+constexpr int kPendingBufRetryIntervalMs = 250;
 
 /* must match loader/vk-layer-hook/config.h */
 constexpr uint32_t kCaptureSlotCount = 3;
@@ -88,35 +94,29 @@ CaptureCoordinator *CaptureCoordinator::instance() {
 CaptureCoordinator::CaptureCoordinator(QObject *parent)
     : QObject(parent), m_captureSocket(new CaptureSocket(this)),
       m_ctlListener(new CtlListener(QStringLiteral("kde"), this)),
-      m_cursorTimer(new QTimer(this)) {
+      m_cursorTimer(new QTimer(this)), m_pendingRetryTimer(new QTimer(this)) {
   connect(m_captureSocket, &CaptureSocket::bufReceived, this,
-          [this](quint32 slot, quint32 width, quint32 height, quint32 stride,
-                 quint64 modifier, bool hasGeometry, qint32 geomX, qint32 geomY,
-                 int fd, int syncFd) {
-            uint32_t channel = slot / kCaptureSlotCount;
-            WallpaperCaptureItem *item = channelItem(channel);
-            if (!item && hasGeometry) {
-              item = claimItemForPosition(channel, geomX, geomY);
-            }
-            if (!item) {
-              item = claimItemForSize(channel, width, height);
-            }
-            if (item) {
-              item->stageBuf(slot, width, height, stride, modifier, fd, syncFd);
-            } else {
-              ::close(fd);
-              if (syncFd >= 0) {
-                ::close(syncFd);
-              }
-            }
+          [this](quint32 slot, quint32 width, quint32 height, quint32 format,
+                 quint32 stride, quint64 modifier, bool hasGeometry,
+                 qint32 geomX, qint32 geomY, int fd, int syncFd) {
+            handleBuf(slot, width, height, format, stride, modifier,
+                      hasGeometry, geomX, geomY, fd, syncFd);
           });
   connect(m_captureSocket, &CaptureSocket::frameReceived, this,
           [this](quint32 slot, int syncFd) {
             uint32_t channel = slot / kCaptureSlotCount;
             if (WallpaperCaptureItem *item = channelItem(channel)) {
               item->stageFrame(slot, syncFd);
-            } else if (syncFd >= 0) {
-              ::close(syncFd);
+            } else {
+              if (syncFd >= 0) {
+                ::close(syncFd);
+              }
+              if (m_loggedDroppedChannels.insert(channel).second) {
+                qWarning() << "[coordinator] dropping frames for channel"
+                           << channel
+                           << "- output not bound yet (further drops on this "
+                              "channel won't be logged)";
+              }
             }
           });
   connect(m_captureSocket, &CaptureSocket::shmReceived, this,
@@ -140,6 +140,23 @@ CaptureCoordinator::CaptureCoordinator(QObject *parent)
             Qt::BlockingQueuedConnection);
         return result;
       });
+  m_ctlListener->setRenderNodeProvider(
+      [this]() -> std::optional<std::pair<uint32_t, uint32_t>> {
+        std::optional<std::pair<uint32_t, uint32_t>> result;
+        QMetaObject::invokeMethod(
+            this,
+            [this, &result]() {
+              if (!m_primaryItem) {
+                return;
+              }
+              uint32_t major = 0, minor = 0;
+              if (m_primaryItem->queryRenderNode(&major, &minor)) {
+                result = std::make_pair(major, minor);
+              }
+            },
+            Qt::BlockingQueuedConnection);
+        return result;
+      });
   m_ctlListener->setDetachHandler([this]() {
     QMetaObject::invokeMethod(
         this, [this]() { handleDetach(); }, Qt::BlockingQueuedConnection);
@@ -149,6 +166,14 @@ CaptureCoordinator::CaptureCoordinator(QObject *parent)
         this, [this, enabled]() { handleSetDebug(enabled); },
         Qt::BlockingQueuedConnection);
   });
+  m_ctlListener->setCaptureHandler(
+      [this](uint32_t channel, const QString &path, QString &err) -> bool {
+        return captureChannel(channel, path, err);
+      });
+
+  m_pendingRetryTimer->setInterval(kPendingBufRetryIntervalMs);
+  connect(m_pendingRetryTimer, &QTimer::timeout, this,
+          [this]() { retryPendingBufs(); });
 
   m_cursorTimer->setInterval(kCursorSampleIntervalMs);
   connect(m_cursorTimer, &QTimer::timeout, this, [this]() {
@@ -168,6 +193,7 @@ void CaptureCoordinator::registerItem(WallpaperCaptureItem *item) {
   m_items.push_back(item);
   ensureSocketsBound();
   reevaluateActiveItem();
+  retryPendingBufs();
 }
 
 void CaptureCoordinator::unregisterItem(WallpaperCaptureItem *item) {
@@ -222,9 +248,40 @@ WallpaperCaptureItem *CaptureCoordinator::channelItem(uint32_t channel) const {
   return it == m_channelItems.end() ? nullptr : it->second;
 }
 
+WallpaperCaptureItem *
+CaptureCoordinator::claimItemByOutputName(uint32_t channel,
+                                          const QString &name) {
+  for (auto *item : m_items) {
+    bool alreadyClaimed = false;
+    for (const auto &[boundChannel, boundItem] : m_channelItems) {
+      if (boundItem == item) {
+        alreadyClaimed = true;
+        break;
+      }
+    }
+    if (alreadyClaimed) {
+      continue;
+    }
+    QScreen *screen = item->window() ? item->window()->screen() : nullptr;
+    if (screen && screen->name() == name) {
+      m_channelItems[channel] = item;
+      qInfo() << "[coordinator] channel" << channel
+              << "matched by XRandR output name" << name;
+      return item;
+    }
+  }
+  return nullptr;
+}
+
 WallpaperCaptureItem *CaptureCoordinator::claimItemForSize(uint32_t channel,
                                                            quint32 width,
                                                            quint32 height) {
+  if (auto name = x11OutputForSize(width, height)) {
+    if (WallpaperCaptureItem *item = claimItemByOutputName(channel, *name)) {
+      return item;
+    }
+  }
+
   double globalScale = xwaylandGlobalScale();
   for (auto *item : m_items) {
     bool alreadyClaimed = false;
@@ -256,14 +313,17 @@ WallpaperCaptureItem *CaptureCoordinator::claimItemForSize(uint32_t channel,
       return item;
     }
   }
-  qWarning() << "[coordinator] no registered wallpaper item predicted to be"
-             << width << "x" << height << "at XWayland scale" << globalScale
-             << "(or already claimed) -- cannot bind channel" << channel;
   return nullptr;
 }
 
 WallpaperCaptureItem *
 CaptureCoordinator::claimItemForPosition(uint32_t channel, qint32 x, qint32 y) {
+  if (auto name = x11OutputForPosition(x, y)) {
+    if (WallpaperCaptureItem *item = claimItemByOutputName(channel, *name)) {
+      return item;
+    }
+  }
+
   double globalScale = xwaylandGlobalScale();
   for (auto *item : m_items) {
     bool alreadyClaimed = false;
@@ -294,10 +354,66 @@ CaptureCoordinator::claimItemForPosition(uint32_t channel, qint32 x, qint32 y) {
       return item;
     }
   }
-  qWarning() << "[coordinator] no registered wallpaper item predicted at" << x
-             << "," << y << "at XWayland scale" << globalScale
-             << "(or already claimed) cannot bind channel" << channel;
   return nullptr;
+}
+
+WallpaperCaptureItem *
+CaptureCoordinator::claimItem(uint32_t channel, quint32 width, quint32 height,
+                              bool hasGeometry, qint32 geomX, qint32 geomY) {
+  WallpaperCaptureItem *item = channelItem(channel);
+  if (!item && hasGeometry) {
+    item = claimItemForPosition(channel, geomX, geomY);
+  }
+  if (!item) {
+    item = claimItemForSize(channel, width, height);
+  }
+  return item;
+}
+
+void CaptureCoordinator::handleBuf(quint32 slot, quint32 width, quint32 height,
+                                   quint32 format, quint32 stride,
+                                   quint64 modifier, bool hasGeometry,
+                                   qint32 geomX, qint32 geomY, int fd,
+                                   int syncFd) {
+  uint32_t channel = slot / kCaptureSlotCount;
+  WallpaperCaptureItem *item =
+      claimItem(channel, width, height, hasGeometry, geomX, geomY);
+  if (item) {
+    item->stageBuf(slot, width, height, format, stride, modifier, fd, syncFd);
+    return;
+  }
+
+  auto it = m_pendingBufs.find(slot);
+  if (it != m_pendingBufs.end()) {
+    ::close(it->second.fd);
+    if (it->second.syncFd >= 0) {
+      ::close(it->second.syncFd);
+    }
+  }
+  m_pendingBufs[slot] =
+      PendingBuf{width,       height, format, stride, modifier,
+                 hasGeometry, geomX,  geomY,  fd,     syncFd};
+  qInfo() << "[coordinator] no wallpaper item available yet for new channel"
+          << channel << "(" << width << "x" << height << "), queued for retry";
+}
+
+void CaptureCoordinator::retryPendingBufs() {
+  for (auto it = m_pendingBufs.begin(); it != m_pendingBufs.end();) {
+    quint32 slot = it->first;
+    const PendingBuf &pending = it->second;
+    uint32_t channel = slot / kCaptureSlotCount;
+    WallpaperCaptureItem *item =
+        claimItem(channel, pending.width, pending.height, pending.hasGeometry,
+                  pending.geomX, pending.geomY);
+    if (!item) {
+      ++it;
+      continue;
+    }
+    item->stageBuf(slot, pending.width, pending.height, pending.format,
+                   pending.stride, pending.modifier, pending.fd,
+                   pending.syncFd);
+    it = m_pendingBufs.erase(it);
+  }
 }
 
 void CaptureCoordinator::ensureSocketsBound() {
@@ -306,12 +422,24 @@ void CaptureCoordinator::ensureSocketsBound() {
   if (!m_cursorTimer->isActive()) {
     m_cursorTimer->start();
   }
+  if (!m_pendingRetryTimer->isActive()) {
+    m_pendingRetryTimer->start();
+  }
 }
 
 void CaptureCoordinator::teardownSockets() {
   m_captureSocket->stop();
   m_ctlListener->stop();
   m_cursorTimer->stop();
+  m_pendingRetryTimer->stop();
+  for (auto &[slot, pending] : m_pendingBufs) {
+    ::close(pending.fd);
+    if (pending.syncFd >= 0) {
+      ::close(pending.syncFd);
+    }
+  }
+  m_pendingBufs.clear();
+  m_loggedDroppedChannels.clear();
 }
 
 std::optional<WallpiperProtocol::MonitorGeometry>
@@ -327,6 +455,57 @@ void CaptureCoordinator::handleDetach() {
     item->requestDetach();
   }
   qInfo() << "[ctl] detached, released all buffers";
+}
+
+bool CaptureCoordinator::captureChannel(uint32_t channel, const QString &path,
+                                        QString &err) {
+  struct BeginCaptureResult {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool done = false;
+    std::shared_ptr<CaptureCompletion> completion;
+  };
+  auto begin = std::make_shared<BeginCaptureResult>();
+
+  QMetaObject::invokeMethod(
+      this,
+      [this, channel, path, begin]() {
+        std::shared_ptr<CaptureCompletion> completion;
+        if (WallpaperCaptureItem *item = channelItem(channel)) {
+          completion = item->beginCapture(path);
+        }
+        std::lock_guard<std::mutex> lock(begin->mutex);
+        begin->completion = std::move(completion);
+        begin->done = true;
+        begin->cv.notify_all();
+      },
+      Qt::QueuedConnection);
+
+  std::shared_ptr<CaptureCompletion> completion;
+  {
+    std::unique_lock<std::mutex> lock(begin->mutex);
+    if (!begin->cv.wait_for(lock, std::chrono::seconds(8),
+                            [&] { return begin->done; })) {
+      err = QStringLiteral("timed out waiting for capture to start");
+      return false;
+    }
+    completion = begin->completion;
+  }
+
+  if (!completion) {
+    err = QStringLiteral("no wallpaper item bound to channel %1").arg(channel);
+    return false;
+  }
+
+  std::unique_lock<std::mutex> lock(completion->mutex);
+  bool signaled = completion->cv.wait_for(lock, std::chrono::seconds(8),
+                                          [&] { return completion->done; });
+  if (!signaled) {
+    err = QStringLiteral("timed out waiting for capture");
+    return false;
+  }
+  err = completion->err;
+  return completion->ok;
 }
 
 void CaptureCoordinator::handleSetDebug(bool enabled) {

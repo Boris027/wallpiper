@@ -25,14 +25,17 @@
 
 #include "egl_dmabuf_importer.h"
 #include "protocol.h"
+#include "vulkan_dmabuf_importer.h"
 
 #include <QQuickItem>
 #include <QSGTexture>
 #include <qopengl.h>
 #include <qqmlintegration.h>
 
+#include <condition_variable>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <unordered_map>
 
@@ -45,6 +48,14 @@ struct BlitProgramState {
   GLuint vbo = 0;
   bool ready = false;
   bool failed = false;
+};
+
+struct CaptureCompletion {
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool done = false;
+  bool ok = false;
+  QString err;
 };
 
 class WallpaperCaptureItem : public QQuickItem {
@@ -63,13 +74,15 @@ public:
 
   void componentComplete() override;
 
-  void stageBuf(quint32 slot, quint32 width, quint32 height, quint32 stride,
-                quint64 modifier, int fd, int syncFd);
+  void stageBuf(quint32 slot, quint32 width, quint32 height, quint32 format,
+                quint32 stride, quint64 modifier, int fd, int syncFd);
   void stageFrame(quint32 slot, int syncFd);
   void stageShm(quint32 width, quint32 height, quint32 stride, int fd);
   void clearDisplay();
   void requestDetach();
   void setDebugEnabled(bool enabled);
+
+  std::shared_ptr<CaptureCompletion> beginCapture(const QString &path);
 
   bool debugEnabled() const { return m_debugEnabled; }
   int displayFps() const { return m_displayFps; }
@@ -78,6 +91,7 @@ public:
   double peakFrameMs() const { return m_peakFrameMs; }
 
   std::optional<WallpiperProtocol::MonitorGeometry> currentGeometry() const;
+  bool queryRenderNode(uint32_t *major, uint32_t *minor) const;
 
 signals:
   void debugEnabledChanged();
@@ -88,10 +102,14 @@ protected:
                            UpdatePaintNodeData *data) override;
 
 private:
+  enum class Backend { None, Egl, Vulkan };
+
   struct SlotTexture {
-    EglDmabufImporter::Import import;
+    std::optional<EglDmabufImporter::Import> eglImport;
+    std::optional<VulkanDmabufImporter::Import> vkImport;
     quint32 width = 0;
     quint32 height = 0;
+    quint32 format = 0;
     quint32 stride = 0;
     quint64 modifier = 0;
     int memFd = -1;
@@ -104,6 +122,7 @@ private:
     quint32 slot = 0;
     quint32 width = 0;
     quint32 height = 0;
+    quint32 format = 0;
     quint32 stride = 0;
     quint64 modifier = 0;
     int fd = -1;
@@ -122,6 +141,11 @@ private:
     int syncFd = -1;
   };
 
+  struct PendingCapture {
+    QString path;
+    std::shared_ptr<CaptureCompletion> completion;
+  };
+
   void destroySlot(quint32 slot);
   void destroyAllSlots();
   bool reimportSlot(quint32 slot);
@@ -135,6 +159,8 @@ private:
                          qint64 windowMs);
 
   EglDmabufImporter m_importer;
+  VulkanDmabufImporter m_vkImporter;
+  Backend m_backend = Backend::None;
   BlitProgramState m_blitProgram;
 
   std::unordered_map<quint32, SlotTexture> m_slotTextures;
@@ -145,8 +171,13 @@ private:
   std::optional<PendingSource> m_pendingSource;
   bool m_pendingDetach = false;
 
+  std::mutex m_pendingCaptureMutex;
+  std::optional<PendingCapture> m_pendingCapture;
+
   std::optional<quint32> m_currentSlot;
   bool m_currentIsShm = false;
+
+  std::optional<quint32> m_loggedFormat;
 
   bool m_debugEnabled = false;
   int m_displayFps = 0;

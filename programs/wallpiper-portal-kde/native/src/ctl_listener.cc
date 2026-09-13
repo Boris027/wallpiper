@@ -75,6 +75,14 @@ void CtlListener::setDebugHandler(DebugHandler handler) {
   m_debugHandler = std::move(handler);
 }
 
+void CtlListener::setCaptureHandler(CaptureHandler handler) {
+  m_captureHandler = std::move(handler);
+}
+
+void CtlListener::setRenderNodeProvider(RenderNodeProvider provider) {
+  m_renderNodeProvider = std::move(provider);
+}
+
 void CtlListener::run() {
   const std::string path =
       WallpiperProtocol::ctlSocketPath(m_portalName).toStdString();
@@ -99,16 +107,19 @@ void CtlListener::run() {
 }
 
 void CtlListener::handleConnection(int clientFd) {
+  constexpr size_t kMaxLine = 512;
   std::string line;
   char ch = '\0';
+  bool overflowed = false;
   while (::read(clientFd, &ch, 1) == 1) {
     if (ch == '\n') {
       break;
     }
-    line.push_back(ch);
-    if (line.size() > 256) {
-      break;
+    if (line.size() >= kMaxLine) {
+      overflowed = true;
+      continue;
     }
+    line.push_back(ch);
   }
   if (line.empty()) {
     return;
@@ -127,6 +138,11 @@ void CtlListener::handleConnection(int clientFd) {
       written += static_cast<size_t>(n);
     }
   };
+
+  if (overflowed) {
+    writeResponse(WallpiperProtocol::CtlResponseErr{"request line too long"});
+    return;
+  }
 
   auto request = WallpiperProtocol::parseCtlRequest(line);
   if (!request) {
@@ -181,6 +197,34 @@ void CtlListener::handleConnection(int clientFd) {
     break;
   case WallpiperProtocol::CtlRequest::Ping:
     response = WallpiperProtocol::CtlResponseOk{};
+    break;
+  case WallpiperProtocol::CtlRequest::Capture: {
+    auto args = WallpiperProtocol::parseCtlRequestCapture(line);
+    if (!args) {
+      response = WallpiperProtocol::CtlResponseErr{"malformed capture request"};
+      break;
+    }
+    if (!m_captureHandler) {
+      response = WallpiperProtocol::CtlResponseErr{"capture unavailable"};
+      break;
+    }
+    QString err;
+    if (m_captureHandler(args->channel, args->path, err)) {
+      response = WallpiperProtocol::CtlResponseOk{};
+    } else {
+      response = WallpiperProtocol::CtlResponseErr{err.toStdString()};
+    }
+    break;
+  }
+  case WallpiperProtocol::CtlRequest::RenderNode:
+    if (m_renderNodeProvider) {
+      if (auto node = m_renderNodeProvider()) {
+        response =
+            WallpiperProtocol::CtlResponseRenderNode{node->first, node->second};
+      } else {
+        response = WallpiperProtocol::CtlResponseErr{"render node unavailable"};
+      }
+    }
     break;
   }
   writeResponse(response);

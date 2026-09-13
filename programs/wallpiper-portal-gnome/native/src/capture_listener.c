@@ -27,7 +27,10 @@
 #include "error.h"
 #include "monitor_geometry.h"
 
+#include <wallpiper/vk_format.h>
+
 #include <errno.h>
+#include <gdk-pixbuf/gdk-pixbuf.h>
 #include <glib-unix.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -48,6 +51,7 @@ static void channel_clear(WallpiperCaptureChannel *ch) {
     ch->display_actor = NULL;
   }
   ch->active = FALSE;
+  ch->current_slot_idx = -1;
 }
 
 void wallpiper_capture_listener_detach(WallpiperPortalState *state) {
@@ -99,8 +103,8 @@ static gboolean find_monitor_for_size(WallpiperPortalState *state,
   return FALSE;
 }
 
-static gboolean find_monitor_for_position(WallpiperPortalState *state,
-                                          gint32 x, gint32 y,
+static gboolean find_monitor_for_position(WallpiperPortalState *state, gint32 x,
+                                          gint32 y,
                                           WallpiperMonitorGeometry *out) {
   char x11_name[64];
   if (!wallpiper_x11_output_for_position(x, y, x11_name, sizeof(x11_name))) {
@@ -216,6 +220,7 @@ static void handle_buf_message(WallpiperPortalState *state, char **parts,
   guint32 wire_slot = (guint32)g_ascii_strtoull(parts[1], NULL, 10);
   guint32 width = (guint32)g_ascii_strtoull(parts[2], NULL, 10);
   guint32 height = (guint32)g_ascii_strtoull(parts[3], NULL, 10);
+  guint32 format = (guint32)g_ascii_strtoull(parts[4], NULL, 10);
   guint32 stride = (guint32)g_ascii_strtoull(parts[5], NULL, 10);
   guint64 modifier = g_ascii_strtoull(parts[6], NULL, 10);
 
@@ -266,18 +271,23 @@ static void handle_buf_message(WallpiperPortalState *state, char **parts,
     g_message("wallpiper-gnome: channel %u bound to monitor at (%d,%d) %ux%u "
               "for stream %ux%u%s",
               channel_idx, monitor.x, monitor.y, monitor.width, monitor.height,
-              width, height, has_geometry ? " (matched by real window position)" : "");
+              width, height,
+              has_geometry ? " (matched by real window position)" : "");
   }
 
-  g_message("wallpiper-gnome: BUF channel=%u local=%u %ux%u stride=%u "
-            "modifier=0x%llx fd=%d",
-            channel_idx, local_idx, width, height, stride,
+  gboolean format_matched = FALSE;
+  guint32 fourcc =
+      wp_drm_fourcc_from_vk_format(format, &format_matched);
+  g_message("wallpiper-gnome: BUF channel=%u local=%u %ux%u VkFormat=%u -> "
+            "DRM fourcc 0x%08x%s stride=%u modifier=0x%llx fd=%d",
+            channel_idx, local_idx, width, height, format, fourcc,
+            format_matched ? "" : " (unrecognized, defaulted)", stride,
             (unsigned long long)modifier, dmabuf_fd);
 
   GError *local_error = NULL;
   CoglTexture *texture = wallpiper_egl_import_dmabuf(
-      state->cogl_context, state->egl_display, dmabuf_fd, width, height, stride,
-      0, modifier, &local_error);
+      state->cogl_context, state->egl_display, dmabuf_fd, width, height,
+      format, stride, 0, modifier, &local_error);
   close(dmabuf_fd);
 
   if (!texture) {
@@ -297,6 +307,7 @@ static void handle_buf_message(WallpiperPortalState *state, char **parts,
   slot->texture = texture;
 
   display_slot(ch, slot);
+  ch->current_slot_idx = (gint)local_idx;
 
   g_message("wallpiper-gnome: displaying channel=%u local=%u", channel_idx,
             local_idx);
@@ -321,6 +332,7 @@ static void handle_frame_message(WallpiperPortalState *state, char **parts,
     return;
 
   display_slot(ch, &ch->slots[local_idx]);
+  ch->current_slot_idx = (gint)local_idx;
   g_message("wallpiper-gnome: FRAME -> displaying channel=%u local=%u",
             channel_idx, local_idx);
 }
@@ -403,4 +415,46 @@ void wallpiper_capture_listener_stop(WallpiperPortalState *state) {
   for (int i = 0; i < WP_MAX_CAPTURE_CHANNELS; i++) {
     channel_clear(&state->channels[i]);
   }
+}
+
+gboolean wallpiper_capture_listener_readback(
+    WallpiperPortalState *state, guint32 channel, guint8 **out_pixels,
+    guint32 *out_width, guint32 *out_height, GError **error) {
+  if (channel >= WP_MAX_CAPTURE_CHANNELS) {
+    g_set_error(error, WALLPIPER_ERROR, 0, "invalid channel %u", channel);
+    return FALSE;
+  }
+
+  WallpiperCaptureChannel *ch = &state->channels[channel];
+  if (!ch->active || ch->current_slot_idx < 0) {
+    g_set_error(error, WALLPIPER_ERROR, 0,
+                "no active wallpaper frame on channel %u", channel);
+    return FALSE;
+  }
+
+  WallpiperCaptureSlot *slot = &ch->slots[ch->current_slot_idx];
+  if (!slot->used || !slot->texture) {
+    g_set_error(error, WALLPIPER_ERROR, 0,
+                "no active wallpaper frame on channel %u", channel);
+    return FALSE;
+  }
+
+  guint32 width = slot->width;
+  guint32 height = slot->height;
+  int rowstride = (int)width * 4;
+  guint8 *pixels = g_malloc((gsize)rowstride * height);
+
+  int got = cogl_texture_get_data(slot->texture, COGL_PIXEL_FORMAT_RGBA_8888,
+                                  (unsigned int)rowstride, pixels);
+  if (got == 0) {
+    g_free(pixels);
+    g_set_error(error, WALLPIPER_ERROR, 0,
+                "cogl_texture_get_data failed for channel %u", channel);
+    return FALSE;
+  }
+
+  *out_pixels = pixels;
+  *out_width = width;
+  *out_height = height;
+  return TRUE;
 }

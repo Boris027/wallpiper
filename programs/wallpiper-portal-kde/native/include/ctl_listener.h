@@ -45,6 +45,10 @@ public:
       std::function<std::optional<WallpiperProtocol::MonitorGeometry>()>;
   using DetachHandler = std::function<void()>;
   using DebugHandler = std::function<void(bool)>;
+  using CaptureHandler =
+      std::function<bool(uint32_t channel, const QString &path, QString &err)>;
+  using RenderNodeProvider =
+      std::function<std::optional<std::pair<uint32_t, uint32_t>>()>;
 
   explicit CtlListener(QString portalName, QObject *parent = nullptr);
   ~CtlListener() override;
@@ -56,6 +60,8 @@ public:
   void setGeometryProvider(GeometryProvider provider);
   void setDetachHandler(DetachHandler handler);
   void setDebugHandler(DebugHandler handler);
+  void setCaptureHandler(CaptureHandler handler);
+  void setRenderNodeProvider(RenderNodeProvider provider);
 
 private:
   void run();
@@ -70,6 +76,8 @@ private:
   GeometryProvider m_geometryProvider;
   DetachHandler m_detachHandler;
   DebugHandler m_debugHandler;
+  CaptureHandler m_captureHandler;
+  RenderNodeProvider m_renderNodeProvider;
 };
 
 } // namespace WallpiperKde

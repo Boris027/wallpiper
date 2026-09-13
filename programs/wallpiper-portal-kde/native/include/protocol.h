@@ -58,6 +58,7 @@ struct BufEvent {
   uint32_t slot = 0;
   uint32_t width = 0;
   uint32_t height = 0;
+  uint32_t format = 0;
   uint32_t stride = 0;
   uint64_t modifier = 0;
   bool hasGeometry = false;
@@ -102,10 +103,20 @@ enum class CtlRequest {
   DebugOff,
   CursorPos,
   Ping,
+  Capture,
+  RenderNode,
 };
 
 std::optional<CtlRequest> parseCtlRequest(const std::string &line);
 std::string encodeCtlRequest(CtlRequest request);
+
+struct CtlRequestCapture {
+  uint32_t channel = 0;
+  QString path;
+};
+/* Only valid to call when parseCtlRequest() returned CtlRequest::Capture
+ * for the same line. */
+std::optional<CtlRequestCapture> parseCtlRequestCapture(const std::string &line);
 
 struct CtlResponseOk {};
 struct CtlResponseErr {
@@ -118,8 +129,13 @@ struct CtlResponseCursorPos {
   int32_t x = 0;
   int32_t y = 0;
 };
+struct CtlResponseRenderNode {
+  uint32_t major = 0;
+  uint32_t minor = 0;
+};
 
-using CtlResponse = std::variant<CtlResponseOk, CtlResponseErr,
-                                 CtlResponseGeometry, CtlResponseCursorPos>;
+using CtlResponse =
+    std::variant<CtlResponseOk, CtlResponseErr, CtlResponseGeometry,
+                CtlResponseCursorPos, CtlResponseRenderNode>;
 std::string encodeCtlResponse(const CtlResponse &response);
 } // namespace WallpiperProtocol
