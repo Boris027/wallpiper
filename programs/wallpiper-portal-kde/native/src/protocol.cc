@@ -28,6 +28,7 @@
 #include <cctype>
 #include <cstddef>
 #include <cstring>
+#include <limits>
 #include <sstream>
 #include <vector>
 
@@ -318,8 +319,14 @@ std::optional<CtlRequestCapture> parseCtlRequestCapture(const std::string &line)
   }
 
   try {
+    size_t consumed = 0;
+    unsigned long channel = std::stoul(channelStr, &consumed);
+    if (consumed != channelStr.size() ||
+        channel > std::numeric_limits<uint32_t>::max()) {
+      return std::nullopt;
+    }
     CtlRequestCapture result;
-    result.channel = static_cast<uint32_t>(std::stoul(channelStr));
+    result.channel = static_cast<uint32_t>(channel);
     result.path = QString::fromStdString(rest);
     return result;
   } catch (const std::exception &) {

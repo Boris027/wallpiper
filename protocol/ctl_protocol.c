@@ -388,6 +388,9 @@ struct wp_ctl_listener {
   uint32_t pending_capture_channel;
   char pending_capture_path[WP_CTL_CAPTURE_PATH_MAX];
   wp_ctl_response_t pending_reply;
+
+  int active_captures;
+  pthread_cond_t drain_cond;
 };
 
 static void *ctl_listener_thread_main(void *arg) {
@@ -531,12 +534,14 @@ wp_ctl_listener_t *wp_ctl_listener_start(const char *portal_name,
   listener->running = true;
   pthread_mutex_init(&listener->mutex, NULL);
   pthread_cond_init(&listener->cond, NULL);
+  pthread_cond_init(&listener->drain_cond, NULL);
 
   if (pthread_create(&listener->thread, NULL, ctl_listener_thread_main,
                      listener) != 0) {
     close(sock);
     pthread_mutex_destroy(&listener->mutex);
     pthread_cond_destroy(&listener->cond);
+    pthread_cond_destroy(&listener->drain_cond);
     free(listener);
     return NULL;
   }
@@ -552,9 +557,32 @@ void wp_ctl_listener_stop(wp_ctl_listener_t *listener) {
   shutdown(listener->listen_fd, SHUT_RDWR);
   close(listener->listen_fd);
   pthread_join(listener->thread, NULL);
+
+  pthread_mutex_lock(&listener->mutex);
+  while (listener->active_captures > 0) {
+    pthread_cond_wait(&listener->drain_cond, &listener->mutex);
+  }
+  pthread_mutex_unlock(&listener->mutex);
+
   pthread_mutex_destroy(&listener->mutex);
   pthread_cond_destroy(&listener->cond);
+  pthread_cond_destroy(&listener->drain_cond);
   free(listener);
+}
+
+void wp_ctl_listener_capture_begin(wp_ctl_listener_t *listener) {
+  pthread_mutex_lock(&listener->mutex);
+  listener->active_captures++;
+  pthread_mutex_unlock(&listener->mutex);
+}
+
+void wp_ctl_listener_capture_end(wp_ctl_listener_t *listener) {
+  pthread_mutex_lock(&listener->mutex);
+  listener->active_captures--;
+  if (listener->active_captures == 0) {
+    pthread_cond_broadcast(&listener->drain_cond);
+  }
+  pthread_mutex_unlock(&listener->mutex);
 }
 
 bool wp_ctl_listener_poll(wp_ctl_listener_t *listener,
@@ -574,6 +602,17 @@ void wp_ctl_listener_get_capture_args(wp_ctl_listener_t *listener,
                                       uint32_t *out_channel, char *out_path,
                                       size_t out_path_len) {
   pthread_mutex_lock(&listener->mutex);
+  *out_channel = listener->pending_capture_channel;
+  snprintf(out_path, out_path_len, "%s", listener->pending_capture_path);
+  pthread_mutex_unlock(&listener->mutex);
+}
+
+void wp_ctl_listener_get_capture_request(wp_ctl_listener_t *listener,
+                                         uint32_t *out_generation,
+                                         uint32_t *out_channel, char *out_path,
+                                         size_t out_path_len) {
+  pthread_mutex_lock(&listener->mutex);
+  *out_generation = listener->generation;
   *out_channel = listener->pending_capture_channel;
   snprintf(out_path, out_path_len, "%s", listener->pending_capture_path);
   pthread_mutex_unlock(&listener->mutex);

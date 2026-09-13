@@ -95,6 +95,7 @@ static void *wp_wl_capture_encode_and_reply(void *arg) {
   }
 
   wp_ctl_listener_reply(job->listener, job->generation, &response);
+  wp_ctl_listener_capture_end(job->listener);
 
   free(job->pixels);
   free(job);
@@ -147,8 +148,8 @@ static void handle_ctl_request(wp_wl_state_t *state, wp_ctl_request_t request) {
   case WP_CTL_REQUEST_CAPTURE: {
     uint32_t channel = 0;
     char path[WP_CTL_CAPTURE_PATH_MAX];
-    wp_ctl_listener_get_capture_args(state->ctl_listener, &channel, path,
-                                     sizeof(path));
+    wp_ctl_listener_get_capture_request(state->ctl_listener, &generation,
+                                        &channel, path, sizeof(path));
 
     uint8_t *pixels = NULL;
     int width = 0, height = 0;
@@ -172,9 +173,11 @@ static void handle_ctl_request(wp_wl_state_t *state, wp_ctl_request_t request) {
     job->listener = state->ctl_listener;
     job->generation = generation;
 
+    wp_ctl_listener_capture_begin(job->listener);
     pthread_t thread;
     if (pthread_create(&thread, NULL, wp_wl_capture_encode_and_reply, job) !=
         0) {
+      wp_ctl_listener_capture_end(job->listener);
       free(pixels);
       free(job);
       response.tag = WP_CTL_RESPONSE_ERR;

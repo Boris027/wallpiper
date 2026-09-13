@@ -68,7 +68,7 @@ static void *wp_gnome_capture_encode_and_reply(void *arg) {
   }
   g_clear_error(&save_error);
 
-  send(job->client_fd, response, strlen(response), 0);
+  send(job->client_fd, response, strlen(response), MSG_NOSIGNAL);
   g_free(response);
   close(job->client_fd);
 
@@ -214,7 +214,7 @@ static gboolean on_ctl_socket_connectable(gint fd, GIOCondition condition,
     response = g_strdup_printf("ERR unrecognized command\n");
   }
 
-  send(client_fd, response, strlen(response), 0);
+  send(client_fd, response, strlen(response), MSG_NOSIGNAL);
   g_free(response);
   close(client_fd);
 

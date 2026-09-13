@@ -26,6 +26,7 @@
 
 #include <wallpiper/vk_format.h>
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -66,16 +67,44 @@ typedef struct {
 static wp_wl_egl_capture_ctx_t g_ctx;
 
 static bool open_render_node(int *out_fd) {
-  for (int minor = 128; minor < 136; minor++) {
-    char path[64];
-    snprintf(path, sizeof(path), "/dev/dri/renderD%d", minor);
-    int fd = open(path, O_RDWR | O_CLOEXEC);
-    if (fd >= 0) {
-      *out_fd = fd;
-      return true;
+  DIR *dir = opendir("/dev/dri");
+  if (!dir) {
+    return false;
+  }
+
+  bool found = false;
+  int best_minor = -1;
+  char best_path[64];
+  struct dirent *entry;
+  while ((entry = readdir(dir)) != NULL) {
+    int minor;
+    int matched_len = 0;
+    if (sscanf(entry->d_name, "renderD%d%n", &minor, &matched_len) != 1 ||
+        entry->d_name[matched_len] != '\0') {
+      continue;
+    }
+    if (!found || minor < best_minor) {
+      best_minor = minor;
+      int n = snprintf(best_path, sizeof(best_path), "/dev/dri/renderD%d",
+                       minor);
+      if (n < 0 || (size_t)n >= sizeof(best_path)) {
+        continue;
+      }
+      found = true;
     }
   }
-  return false;
+  closedir(dir);
+
+  if (!found) {
+    return false;
+  }
+
+  int fd = open(best_path, O_RDWR | O_CLOEXEC);
+  if (fd < 0) {
+    return false;
+  }
+  *out_fd = fd;
+  return true;
 }
 
 static GLuint compile_shader(GLenum type, const char *src) {

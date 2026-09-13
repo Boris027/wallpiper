@@ -282,7 +282,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL wp_EnumeratePhysicalDeviceGroups(
       if (drm.renderMajor != want_major || drm.renderMinor != want_minor) {
         continue;
       }
+      VkPhysicalDevice matched = group->physicalDevices[d];
       pPhysicalDeviceGroupProperties[0] = *group;
+      pPhysicalDeviceGroupProperties[0].physicalDeviceCount = 1;
+      pPhysicalDeviceGroupProperties[0].physicalDevices[0] = matched;
       *pPhysicalDeviceGroupCount = 1;
       found_preferred = true;
       WP_LOG("enumerate_physical_device_groups: restricting target process "

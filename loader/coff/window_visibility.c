@@ -67,7 +67,11 @@ static HWND WINAPI fake_CreateWindowExW(DWORD exStyle, LPCWSTR className,
 
 static BOOL WINAPI fake_ShowWindow(HWND hwnd, int cmdShow) {
   if (cmdShow != SW_HIDE && is_under_fake_workerw(hwnd)) {
-    return TRUE;
+    BOOL wasVisible = IsWindowVisible(hwnd);
+    if (real_ShowWindow) {
+      real_ShowWindow(hwnd, SW_HIDE);
+    }
+    return wasVisible;
   }
   return real_ShowWindow ? real_ShowWindow(hwnd, cmdShow) : FALSE;
 }

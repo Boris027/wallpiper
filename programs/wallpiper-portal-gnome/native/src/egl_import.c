@@ -130,9 +130,13 @@ CoglTexture *wallpiper_egl_import_dmabuf(CoglContext *cogl_context,
     return NULL;
   }
 
+  CoglPixelFormat pixel_format = fourcc == WP_DRM_FORMAT_XBGR8888
+                                     ? COGL_PIXEL_FORMAT_RGBX_8888
+                                     : COGL_PIXEL_FORMAT_BGRX_8888;
+
   GError *texture_error = NULL;
   CoglTexture *texture = cogl_texture_2d_new_from_egl_image(
-      cogl_context, (int)width, (int)height, COGL_PIXEL_FORMAT_BGRX_8888, image,
+      cogl_context, (int)width, (int)height, pixel_format, image,
       COGL_EGL_IMAGE_FLAG_NONE, &texture_error);
 
   eglDestroyImageKHR_(egl_display, image);

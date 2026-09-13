@@ -42,6 +42,7 @@
 #include "wallpiper/ctl_protocol.h"
 #include "wallpiper/debug_overlay.h"
 #include "wallpiper/monitor_geometry.h"
+#include "wallpiper/vk_format.h"
 
 /* must match loader/vk-layer-hook/config.h */
 #define WP_I3_CAPTURE_SLOT_COUNT 3
@@ -413,6 +414,17 @@ static void handle_buf(wp_i3_state_t *state, uint32_t wire_slot, uint32_t width,
     return;
   }
 
+  int format_matched = 0;
+  uint32_t fourcc = wp_drm_fourcc_from_vk_format(format, &format_matched);
+  if (!format_matched || fourcc != WP_DRM_FORMAT_XRGB8888) {
+    printf("[socket] VkFormat=%u on channel %u doesn't match this X server's "
+           "TrueColor visual byte order, dropping (DRI3 import can't "
+           "reinterpret channel order)\n",
+           format, channel);
+    close(fd);
+    return;
+  }
+
   wp_i3_output_t *out = find_output_for_channel(state, channel);
   if (!out) {
     out = claim_output_for_size(state, channel, width, height);
@@ -523,8 +535,8 @@ static void handle_capture_event(wp_i3_state_t *state,
     if (event->nfds > 1) {
       close(event->fds[1]);
     }
-    handle_buf(state, event->slot, event->width, event->height,
-               event->format, event->stride, event->modifier, image_fd);
+    handle_buf(state, event->slot, event->width, event->height, event->format,
+               event->stride, event->modifier, image_fd);
     break;
   }
   case WP_CAPTURE_EVENT_FRAME: {
@@ -681,6 +693,7 @@ static void *capture_encode_and_reply(void *arg) {
   }
 
   wp_ctl_listener_reply(job->listener, job->generation, &response);
+  wp_ctl_listener_capture_end(job->listener);
 
   free(job->pixels);
   free(job);
@@ -724,7 +737,8 @@ static void handle_ctl_request(wp_i3_state_t *state, wp_ctl_request_t request,
   case WP_CTL_REQUEST_CAPTURE: {
     uint32_t channel = 0;
     char path[WP_CTL_CAPTURE_PATH_MAX];
-    wp_ctl_listener_get_capture_args(listener, &channel, path, sizeof(path));
+    wp_ctl_listener_get_capture_request(listener, &generation, &channel, path,
+                                        sizeof(path));
 
     uint8_t *pixels = NULL;
     int width = 0, height = 0;
@@ -748,8 +762,10 @@ static void handle_ctl_request(wp_i3_state_t *state, wp_ctl_request_t request,
     job->listener = listener;
     job->generation = generation;
 
+    wp_ctl_listener_capture_begin(job->listener);
     pthread_t thread;
     if (pthread_create(&thread, NULL, capture_encode_and_reply, job) != 0) {
+      wp_ctl_listener_capture_end(job->listener);
       free(pixels);
       free(job);
       response.tag = WP_CTL_RESPONSE_ERR;

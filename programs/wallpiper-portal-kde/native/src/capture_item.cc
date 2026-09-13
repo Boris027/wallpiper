@@ -720,7 +720,7 @@ QSGNode *WallpaperCaptureItem::updatePaintNode(QSGNode *oldNode,
       gl->glReadPixels(0, 0, captureWidth, captureHeight, GL_RGBA,
                        GL_UNSIGNED_BYTE, image.bits());
       gl->glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(prevFbo));
-      image = image.flipped(Qt::Vertical);
+      image = image.mirrored(false, true);
       ok = true;
     } else {
       captureErr = QStringLiteral("no OpenGL context on render thread");

@@ -37,6 +37,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
 
 #include <unistd.h>
 
@@ -91,14 +94,13 @@ CaptureCoordinator *CaptureCoordinator::instance() {
 CaptureCoordinator::CaptureCoordinator(QObject *parent)
     : QObject(parent), m_captureSocket(new CaptureSocket(this)),
       m_ctlListener(new CtlListener(QStringLiteral("kde"), this)),
-      m_cursorTimer(new QTimer(this)),
-      m_pendingRetryTimer(new QTimer(this)) {
+      m_cursorTimer(new QTimer(this)), m_pendingRetryTimer(new QTimer(this)) {
   connect(m_captureSocket, &CaptureSocket::bufReceived, this,
           [this](quint32 slot, quint32 width, quint32 height, quint32 format,
                  quint32 stride, quint64 modifier, bool hasGeometry,
                  qint32 geomX, qint32 geomY, int fd, int syncFd) {
             handleBuf(slot, width, height, format, stride, modifier,
-                     hasGeometry, geomX, geomY, fd, syncFd);
+                      hasGeometry, geomX, geomY, fd, syncFd);
           });
   connect(m_captureSocket, &CaptureSocket::frameReceived, this,
           [this](quint32 slot, int syncFd) {
@@ -110,10 +112,10 @@ CaptureCoordinator::CaptureCoordinator(QObject *parent)
                 ::close(syncFd);
               }
               if (m_loggedDroppedChannels.insert(channel).second) {
-                qWarning()
-                    << "[coordinator] dropping frames for channel" << channel
-                    << "- output not bound yet (further drops on this "
-                       "channel won't be logged)";
+                qWarning() << "[coordinator] dropping frames for channel"
+                           << channel
+                           << "- output not bound yet (further drops on this "
+                              "channel won't be logged)";
               }
             }
           });
@@ -355,12 +357,9 @@ CaptureCoordinator::claimItemForPosition(uint32_t channel, qint32 x, qint32 y) {
   return nullptr;
 }
 
-WallpaperCaptureItem *CaptureCoordinator::claimItem(uint32_t channel,
-                                                    quint32 width,
-                                                    quint32 height,
-                                                    bool hasGeometry,
-                                                    qint32 geomX,
-                                                    qint32 geomY) {
+WallpaperCaptureItem *
+CaptureCoordinator::claimItem(uint32_t channel, quint32 width, quint32 height,
+                              bool hasGeometry, qint32 geomX, qint32 geomY) {
   WallpaperCaptureItem *item = channelItem(channel);
   if (!item && hasGeometry) {
     item = claimItemForPosition(channel, geomX, geomY);
@@ -371,11 +370,11 @@ WallpaperCaptureItem *CaptureCoordinator::claimItem(uint32_t channel,
   return item;
 }
 
-void CaptureCoordinator::handleBuf(quint32 slot, quint32 width,
-                                   quint32 height, quint32 format,
-                                   quint32 stride, quint64 modifier,
-                                   bool hasGeometry, qint32 geomX,
-                                   qint32 geomY, int fd, int syncFd) {
+void CaptureCoordinator::handleBuf(quint32 slot, quint32 width, quint32 height,
+                                   quint32 format, quint32 stride,
+                                   quint64 modifier, bool hasGeometry,
+                                   qint32 geomX, qint32 geomY, int fd,
+                                   int syncFd) {
   uint32_t channel = slot / kCaptureSlotCount;
   WallpaperCaptureItem *item =
       claimItem(channel, width, height, hasGeometry, geomX, geomY);
@@ -391,13 +390,11 @@ void CaptureCoordinator::handleBuf(quint32 slot, quint32 width,
       ::close(it->second.syncFd);
     }
   }
-  m_pendingBufs[slot] = PendingBuf{width,  height,      format,
-                                   stride, modifier,    hasGeometry,
-                                   geomX,  geomY,       fd,
-                                   syncFd};
+  m_pendingBufs[slot] =
+      PendingBuf{width,       height, format, stride, modifier,
+                 hasGeometry, geomX,  geomY,  fd,     syncFd};
   qInfo() << "[coordinator] no wallpaper item available yet for new channel"
-          << channel << "(" << width << "x" << height
-          << "), queued for retry";
+          << channel << "(" << width << "x" << height << "), queued for retry";
 }
 
 void CaptureCoordinator::retryPendingBufs() {
@@ -406,8 +403,8 @@ void CaptureCoordinator::retryPendingBufs() {
     const PendingBuf &pending = it->second;
     uint32_t channel = slot / kCaptureSlotCount;
     WallpaperCaptureItem *item =
-        claimItem(channel, pending.width, pending.height,
-                 pending.hasGeometry, pending.geomX, pending.geomY);
+        claimItem(channel, pending.width, pending.height, pending.hasGeometry,
+                  pending.geomX, pending.geomY);
     if (!item) {
       ++it;
       continue;
@@ -462,15 +459,38 @@ void CaptureCoordinator::handleDetach() {
 
 bool CaptureCoordinator::captureChannel(uint32_t channel, const QString &path,
                                         QString &err) {
-  std::shared_ptr<CaptureCompletion> completion;
+  struct BeginCaptureResult {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool done = false;
+    std::shared_ptr<CaptureCompletion> completion;
+  };
+  auto begin = std::make_shared<BeginCaptureResult>();
+
   QMetaObject::invokeMethod(
       this,
-      [this, channel, &path, &completion]() {
+      [this, channel, path, begin]() {
+        std::shared_ptr<CaptureCompletion> completion;
         if (WallpaperCaptureItem *item = channelItem(channel)) {
           completion = item->beginCapture(path);
         }
+        std::lock_guard<std::mutex> lock(begin->mutex);
+        begin->completion = std::move(completion);
+        begin->done = true;
+        begin->cv.notify_all();
       },
-      Qt::BlockingQueuedConnection);
+      Qt::QueuedConnection);
+
+  std::shared_ptr<CaptureCompletion> completion;
+  {
+    std::unique_lock<std::mutex> lock(begin->mutex);
+    if (!begin->cv.wait_for(lock, std::chrono::seconds(8),
+                            [&] { return begin->done; })) {
+      err = QStringLiteral("timed out waiting for capture to start");
+      return false;
+    }
+    completion = begin->completion;
+  }
 
   if (!completion) {
     err = QStringLiteral("no wallpaper item bound to channel %1").arg(channel);

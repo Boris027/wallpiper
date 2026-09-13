@@ -26,6 +26,8 @@
 #include "config.h"
 #include "logging.h"
 
+#include "wallpiper/vk_format.h"
+
 #include <dlfcn.h>
 #include <stdlib.h>
 #include <string.h>
@@ -597,6 +599,16 @@ static bool get_channel_geometry(uint32_t channel, int32_t *out_x,
 
 void wp_register_swapchain(wp_device_data_t *dd, VkSwapchainKHR swapchain,
                            const VkSwapchainCreateInfoKHR *create_info) {
+  int format_matched = 0;
+  wp_drm_fourcc_from_vk_format((uint32_t)create_info->imageFormat,
+                               &format_matched);
+  if (!format_matched) {
+    WP_LOG("register_swapchain: unsupported VkFormat=%d, capture disabled "
+           "for this swapchain (would corrupt colors)",
+           (int)create_info->imageFormat);
+    return;
+  }
+
   VkImage images[16];
   uint32_t image_count;
   get_swapchain_images(dd, swapchain, images, 16, &image_count);
